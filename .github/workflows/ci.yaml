@@ -19,12 +19,12 @@ jobs:
       - name: Install Temporal CLI (for the e2e dev server)
         # No published setup action exists (temporalio/setup-temporal-cli is
         # not a real repo); install the release binary directly. The binary
-        # extracts as ./temporal-cli/temporal.
+        # extracts at the archive root as ./temporal.
         run: |
           set -euo pipefail
           version=1.9.1
           curl -fsSL "https://github.com/temporalio/cli/releases/download/v${version}/temporal_cli_${version}_linux_amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin --strip-components=1 temporal-cli_${version}_linux_amd64/temporal
+            | sudo tar -xz -C /usr/local/bin temporal
           temporal --version
 
       - name: Lint
