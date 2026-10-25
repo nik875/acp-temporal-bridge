@@ -332,8 +332,14 @@ class BridgeAgent:
 async def _handle_connection(
     temporal: tc.Client, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
+    # listening=False: the constructor already starts the receive loop when
+    # listening defaults True; calling listen() afterwards would run a SECOND
+    # read loop on the same reader ("readuntil() called while another
+    # coroutine is already waiting for incoming data" on the first prompt).
+    # Same pattern as the SDK's own stdio runner.
     conn = AgentSideConnection(
-        lambda client: BridgeAgent(client, temporal), writer, reader
+        lambda client: BridgeAgent(client, temporal), writer, reader,
+        listening=False,
     )
     try:
         await conn.listen()
