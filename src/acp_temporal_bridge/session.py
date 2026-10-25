@@ -102,6 +102,12 @@ def _publish(stream: WorkflowStream, entry: dict[str, Any]) -> None:
       tool_start:      {"kind", "id", "name", "args"}
       tool_end:        {"kind", "id", "output"}
       plan:            {"kind", "todos": [{content, status, priority}]}
+      approval_request: {"kind", "tool", "args", "description"} — published
+                         just before the durable gate pause; the bridge asks
+                         the ACP client (request_permission) and answers via
+                         the resolve_approval update.
+      approval_resolved: {"kind", "action", "response"} — published after the
+                         decision lands (lets replays skip answered gates).
       turn_end:        {"kind", "stop_reason", "output"}
     Model token deltas arrive on the same topic from the plugin's streaming
     activity (ChatGenerationChunk dumps — distinguishable by their
@@ -229,8 +235,29 @@ class AgentSession:
                         "too many approval gates in one run", non_retryable=True
                     )
                 self._pending = policy.pending_from_interrupt(interrupt[0])
+                # Surface the gate on the durable stream BEFORE pausing, so
+                # the bridge (live or replaying) sees what is being waited
+                # on; the bridge asks the ACP client and answers via the
+                # resolve_approval update.
+                _publish(
+                    self._stream,
+                    {
+                        "kind": "approval_request",
+                        "tool": self._pending.tool,
+                        "args": self._pending.args,
+                        "description": self._pending.description,
+                    },
+                )
                 await workflow.wait_condition(lambda: self._decision is not None)
                 decision, self._decision, self._pending = self._decision, None, None
+                _publish(
+                    self._stream,
+                    {
+                        "kind": "approval_resolved",
+                        "action": decision.action,
+                        "response": decision.response,
+                    },
+                )
                 gen_input = Command(resume=decision.to_resume_payload())
         finally:
             # On cancel, keep whatever of the turn already completed.
