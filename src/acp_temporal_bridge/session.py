@@ -30,6 +30,7 @@ from datetime import timedelta
 from typing import Any
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamState
 from temporalio.exceptions import ApplicationError
 
@@ -53,6 +54,20 @@ with workflow.unsafe.imports_passed_through():
     from ._config import SessionSpec, get_tool_builder
 
 MODEL_START_TO_CLOSE_SECS = 600
+# Heartbeat the model activity so a slow/hung LLM call doesn't look dead.
+# The plugin's @_auto_heartbeater only beats when the activity has a
+# heartbeat_timeout; without it, a model call outlasting the infra's
+# patience (LB idle timeouts, kill-tests) zombie-runs until
+# start_to_close while the workflow already retried elsewhere.
+MODEL_HEARTBEAT_TIMEOUT_SECS = int(
+    os.environ.get("ACP_BRIDGE_MODEL_HEARTBEAT_TIMEOUT_SECS", "30")
+)
+# Cap model-activity retries. With no retry policy, Temporal retries
+# forever — a degenerate model streaming garbage floods the durable log
+# on every attempt (observed: 10k+ items in ~2.5 min, workflow poisoned
+# past TMPRL1103). Bounded attempts + the bridge's ReplayOverflowError
+# keep the blast radius one failed turn.
+MODEL_MAX_ATTEMPTS = int(os.environ.get("ACP_BRIDGE_MODEL_MAX_ATTEMPTS", "3"))
 MAX_GATES_PER_RUN = 10
 # Workflow ids are prefixed so external components can distinguish session
 # workflows from others on the queue.
@@ -175,6 +190,14 @@ class AgentSession:
                 stop_reason = "end_turn"
             except asyncio.CancelledError:
                 stop_reason = "cancelled"
+            except Exception:  # noqa: BLE001 — any turn failure keeps the session alive
+                # A failed turn must not kill the session workflow: the
+                # durable stream records stop_reason="error" (the bridge
+                # surfaces it as an ACP prompt error — StopReason is a
+                # closed vocabulary), and the session stays alive for the
+                # next prompt.
+                workflow.logger.exception("turn failed")
+                stop_reason = "error"
             finally:
                 self._turn_task = None
             needs_seed = False
@@ -198,7 +221,9 @@ class AgentSession:
             interrupt_on=policy.build_interrupt_on(list(run.tools)),
             checkpointer=self._checkpointer(),
             activity_options={
-                "start_to_close_timeout": timedelta(seconds=MODEL_START_TO_CLOSE_SECS)
+                "start_to_close_timeout": timedelta(seconds=MODEL_START_TO_CLOSE_SECS),
+                "heartbeat_timeout": timedelta(seconds=MODEL_HEARTBEAT_TIMEOUT_SECS),
+                "retry_policy": RetryPolicy(maximum_attempts=MODEL_MAX_ATTEMPTS),
             },
         )
         config = {"configurable": {"thread_id": workflow.info().workflow_id}}

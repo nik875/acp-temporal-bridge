@@ -31,10 +31,11 @@ import contextlib
 import json
 import os
 import uuid
-from typing import Any
+from typing import Any, get_args
 
 import temporalio.client as tc
 from acp.core import AgentSideConnection  # low-level; acp.run_agent is stdio-only
+from acp.exceptions import RequestError
 from acp.helpers import text_block, tool_content, update_plan
 from acp.interfaces import Client
 from acp.schema import (
@@ -50,6 +51,7 @@ from acp.schema import (
     PlanEntry,
     PromptResponse,
     SessionInfo,
+    StopReason,
     ToolCallProgress,
     ToolCallStart,
     ToolCallUpdate,
@@ -81,6 +83,21 @@ def _bridge_version() -> str:
 TASK_QUEUE = os.environ.get("ACP_BRIDGE_TASK_QUEUE", "durable-agents")
 # Replay buffer bound: a loaded session replays at most this many events.
 REPLAY_MAX_ITEMS = 5000
+# ACP stop reasons are a closed vocabulary; anything else on the durable
+# turn_end (e.g. "error") is surfaced as a prompt failure, never silently
+# mapped onto a fake success.
+ACP_STOP_REASONS = frozenset(get_args(StopReason))
+
+
+class ReplayOverflowError(RuntimeError):
+    """A turn's stream produced more items than REPLAY_MAX_ITEMS without a
+    turn_end.
+
+    prompt() must NEVER return a fabricated successful completion in this
+    case: the turn is either still running or the durable log is degenerate,
+    and a bogus ``end_turn`` would lie to the client (observed in the field
+    as a 10k-item flood that silently "completed" a dead turn).
+    """
 
 
 def configure(**kwargs: Any) -> None:
@@ -321,10 +338,31 @@ class BridgeAgent:
         async for item in stream.subscribe(STREAM_TOPIC, from_offset=offset):
             count += 1
             if count > REPLAY_MAX_ITEMS:
-                break
+                # Never fake a completion: surface the anomaly as a prompt
+                # error. Offsets up to the last consumed item are kept, so a
+                # follow-up prompt resumes rather than replays from scratch.
+                raise ReplayOverflowError(
+                    f"session {session_id}: no turn_end after {REPLAY_MAX_ITEMS} "
+                    f"stream items (from offset {offset}) — turn still running "
+                    "or degenerate log; refusing to report end_turn"
+                )
             data = getattr(item, "data", None)
             if isinstance(data, dict) and data.get("kind") == "turn_end":
-                stop_reason = data.get("stop_reason") or "end_turn"
+                reason = data.get("stop_reason") or "end_turn"
+                if reason not in ACP_STOP_REASONS:
+                    # e.g. "error" from a failed turn: the durable record is
+                    # honest, the ACP surface is an error (StopReason is a
+                    # closed Literal — pydantic would reject "error").
+                    raise RequestError.internal_error(
+                        {
+                            "details": (
+                                f"session {session_id}: turn ended with "
+                                f"stop_reason={reason!r}"
+                            ),
+                            "stop_reason": reason,
+                        }
+                    )
+                stop_reason = reason
                 self._offsets[session_id] = getattr(item, "offset", offset) + 1
                 break
             if isinstance(data, dict) and data.get("kind") == "approval_request":

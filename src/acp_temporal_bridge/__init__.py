@@ -8,7 +8,7 @@ sessions when their PRs land. See README.md for the setup contract
 """
 
 from ._config import SessionSpec, configure
-from .bridge import BridgeAgent, main, serve, translate_stream_item
+from .bridge import BridgeAgent, ReplayOverflowError, main, serve, translate_stream_item
 from .policy import ApprovalDecision, PendingApproval, build_interrupt_on
 from .session import (
     AgentSession,
@@ -27,6 +27,7 @@ __all__ = [
     "PrEvent",
     "PrWatcher",
     "PromptIn",
+    "ReplayOverflowError",
     "SessionSpec",
     "SessionStart",
     "build_interrupt_on",
