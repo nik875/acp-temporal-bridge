@@ -17,7 +17,9 @@ from temporalio.worker import Worker
 
 with workflow.unsafe.imports_passed_through():
     from acp.schema import AgentMessageChunk
+    from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatResult
     from temporalio.deepagents import DeepAgentsPlugin
     from temporalio.deepagents.testing import MockTool, mock_model_provider
 
@@ -233,3 +235,55 @@ async def test_approval_gate_approve_resumes() -> None:
             "gate should be cleared"
         )
         del info  # transcript shape asserted in other tests
+
+
+class _BoomModel(BaseChatModel):
+    """Always-failing model (FakeModel can only script successes)."""
+
+    @property
+    def _llm_type(self) -> str:
+        return "boom"
+
+    def _generate(
+        self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
+    ) -> ChatResult:
+        raise RuntimeError("synthetic model failure")
+
+
+async def test_failed_turn_surfaces_error_and_session_survives() -> None:
+    """A turn whose model activity fails exhausts its bounded retries, records
+    turn_end(stop_reason="error") on the durable stream, and leaves the
+    session workflow alive for the next prompt (run() must not die with the
+    turn — poison-pill containment)."""
+    _configure()
+    plugin = DeepAgentsPlugin(
+        model_provider=lambda name: _BoomModel(),
+        streaming_topic="acp",
+        passthrough_modules=["acp_temporal_bridge"],
+    )
+    async with await _workflow_env() as env, Worker(
+        env.client,
+        task_queue="t",
+        workflows=[AgentSession],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            AgentSession.run,
+            args=[_session_start(), None, None],
+            id=session_workflow_id(SESSION_ID),
+            task_queue="t",
+        )
+        await handle.execute_update(AgentSession.prompt, PromptIn(text="die"))
+        events, _, end = await asyncio.wait_for(
+            _collect_until_turn_end(env.client, 0), timeout=60
+        )
+        assert events[-1]["kind"] == "turn_end", events[-1]
+        assert events[-1]["stop_reason"] == "error", events[-1]
+
+        # The session survived: a follow-up prompt runs to another turn_end.
+        await handle.execute_update(AgentSession.prompt, PromptIn(text="again"))
+        events2, _, _ = await asyncio.wait_for(
+            _collect_until_turn_end(env.client, end), timeout=60
+        )
+        assert events2[-1]["kind"] == "turn_end", events2[-1]
+        assert events2[-1]["stop_reason"] == "error", events2[-1]
