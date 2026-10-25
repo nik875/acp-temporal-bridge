@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import uuid
 from typing import Any
@@ -45,11 +46,13 @@ from acp.schema import (
     ListSessionsResponse,
     LoadSessionResponse,
     NewSessionResponse,
+    PermissionOption,
     PlanEntry,
     PromptResponse,
     SessionInfo,
     ToolCallProgress,
     ToolCallStart,
+    ToolCallUpdate,
 )
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 
@@ -64,6 +67,17 @@ from .session import (
 )
 
 BRIDGE_PORT = int(os.environ.get("ACP_BRIDGE_PORT", "8080"))
+
+
+def _bridge_version() -> str:
+    """Real package version; the hardcoded string was forever stale."""
+    try:
+        from importlib.metadata import PackageNotFoundError
+        from importlib.metadata import version as _v
+
+        return _v("acp-temporal-bridge")
+    except PackageNotFoundError:  # pragma: no cover - odd installs
+        return "0.0.0"
 TASK_QUEUE = os.environ.get("ACP_BRIDGE_TASK_QUEUE", "durable-agents")
 # Replay buffer bound: a loaded session replays at most this many events.
 REPLAY_MAX_ITEMS = 5000
@@ -227,7 +241,10 @@ class BridgeAgent:
         return InitializeResponse(
             protocol_version=protocol_version,
             agent_capabilities=AgentCapabilities(load_session=True),
-            agent_info=Implementation(name="acp-temporal-bridge", version="0.1.0"),
+            agent_info=Implementation(
+                name="acp-temporal-bridge",
+                version=_bridge_version(),
+            ),
         )
 
     async def new_session(
@@ -310,10 +327,57 @@ class BridgeAgent:
                 stop_reason = data.get("stop_reason") or "end_turn"
                 self._offsets[session_id] = getattr(item, "offset", offset) + 1
                 break
+            if isinstance(data, dict) and data.get("kind") == "approval_request":
+                await self._resolve_gate(session_id, handle, data)
+                self._offsets[session_id] = getattr(item, "offset", offset) + 1
+                continue
             for update in translate_stream_item(item):
                 await self._client.session_update(session_id, update)
             self._offsets[session_id] = getattr(item, "offset", offset) + 1
         return PromptResponse(stop_reason=stop_reason)
+
+    async def _resolve_gate(
+        self, session_id: str, handle: tc.WorkflowHandle, gate: dict[str, Any]
+    ) -> None:
+        """Surface a durable HITL gate as an ACP request_permission round-trip.
+
+        Only asks the client when the workflow is actually paused on THIS
+        gate (pending_approval query): on replay, an already-answered
+        approval_request is skipped because the query returns None or a
+        different (newer) gate.
+        """
+        try:
+            pending = await handle.query(AgentSession.pending_approval)
+        except tc.RPCError:
+            pending = None  # workflow gone / query deadline: treat as answered
+        same_gate = (
+            pending is not None
+            and pending.tool == gate.get("tool")
+            and dict(pending.args or {}) == dict(gate.get("args") or {})
+        )
+        if not same_gate:
+            return
+
+        args = gate.get("args") or {}
+        tool_call = ToolCallUpdate(
+            tool_call_id=f"approval-{uuid.uuid4().hex[:12]}",
+            title=f"{gate.get('tool') or 'tool'} {json.dumps(args, default=str)[:120]}",
+            kind="execute",
+            raw_input=args,
+        )
+        options = [
+            PermissionOption(kind="allow_once", name="Allow", option_id="approve"),
+            PermissionOption(kind="reject_once", name="Deny", option_id="respond"),
+        ]
+        resp = await self._client.request_permission(options, session_id, tool_call)
+        out = resp.outcome
+        if getattr(out, "outcome", "") == "selected" and getattr(out, "option_id", "") == "approve":
+            payload = {"action": "approve", "response": None}
+        elif getattr(out, "outcome", "") == "selected":
+            payload = {"action": "respond", "response": f"denied via option {out.option_id}"}
+        else:  # cancelled / closed request
+            payload = {"action": "respond", "response": "denied: permission request cancelled"}
+        await handle.execute_update(AgentSession.resolve_approval, payload)
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         """ACP notification: client asked to cancel the in-flight turn."""
