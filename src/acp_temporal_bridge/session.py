@@ -176,14 +176,11 @@ class AgentSession:
         if not run.tools:
             raise ApplicationError("no tools registered", non_retryable=True)
         self._transcript = list(transcript or [])
-        # First turn of a (re)started run must re-seed the fresh in-memory
-        # checkpointer with the carried transcript; later turns are incremental.
-        needs_seed = True
         while True:
             await workflow.wait_condition(lambda: bool(self._queue))
             prompt = self._queue.pop(0)
             self._turn_count += 1
-            task = asyncio.create_task(self._turn(run, prompt.text, seed=needs_seed))
+            task = asyncio.create_task(self._turn(run, prompt.text))
             self._turn_task = task
             try:
                 await task
@@ -200,7 +197,6 @@ class AgentSession:
                 stop_reason = "error"
             finally:
                 self._turn_task = None
-            needs_seed = False
             _publish(self._stream, {"kind": "turn_end", "stop_reason": stop_reason})
             if (
                 start.force_can_after_turns
@@ -212,7 +208,7 @@ class AgentSession:
                     args=[start, self._stream.get_state(), self._transcript]
                 )
 
-    async def _turn(self, run: SessionSpec, text: str, *, seed: bool) -> None:
+    async def _turn(self, run: SessionSpec, text: str) -> None:
         """One agent turn: stream events to the bridge topic, keep transcript."""
         agent = create_temporal_deep_agent(
             model=run.model,
@@ -228,8 +224,15 @@ class AgentSession:
         )
         config = {"configurable": {"thread_id": workflow.info().workflow_id}}
         human = HumanMessage(content=text)
+        # The checkpointer above is fresh per turn (the agent is rebuilt per
+        # turn), so ALL cross-turn memory must come from the canonical
+        # transcript: seed every turn with the full prior conversation. The
+        # old seed-on-first-turn-only scheme made every turn after the first
+        # amnesiac unless continue-as-new happened to re-seed at the boundary
+        # (found via Paseo E2E: turn 2 answered "no such tool call happened
+        # in this session" for a turn-1 tool call it had made).
         base: list[BaseMessage] = []
-        if seed and self._transcript:
+        if self._transcript:
             base = messages_from_dict(self._transcript)
 
         turn_messages: list[BaseMessage] = []

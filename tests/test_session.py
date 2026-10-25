@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any
+from typing import Any, ClassVar
 
 from temporalio import workflow
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
@@ -19,7 +19,7 @@ with workflow.unsafe.imports_passed_through():
     from acp.schema import AgentMessageChunk
     from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.messages import AIMessage
-    from langchain_core.outputs import ChatResult
+    from langchain_core.outputs import ChatGeneration, ChatResult
     from temporalio.deepagents import DeepAgentsPlugin
     from temporalio.deepagents.testing import MockTool, mock_model_provider
 
@@ -287,3 +287,74 @@ async def test_failed_turn_surfaces_error_and_session_survives() -> None:
         )
         assert events2[-1]["kind"] == "turn_end", events2[-1]
         assert events2[-1]["stop_reason"] == "error", events2[-1]
+
+
+class _RecordingModel(BaseChatModel):
+    """Records the human-visible text it was asked over, per model call."""
+
+    calls: ClassVar[list[str]] = []  # class-level: models are rebuilt per activity
+
+    @property
+    def _llm_type(self) -> str:
+        return "recording"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> _RecordingModel:
+        # The activity binds the tool set before invoking; ignore it.
+        return self
+
+    def _generate(
+        self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
+    ) -> ChatResult:
+        type(self).calls.append("".join(str(m.content) for m in messages))
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok."))])
+
+    async def _agenerate(
+        self, messages: Any, stop: Any = None, run_manager: Any = None, **kwargs: Any
+    ) -> ChatResult:
+        # The streaming model activity drives the async path (see FakeModel).
+        return self._generate(messages)
+
+
+async def test_turn_two_sees_turn_one_memory() -> None:
+    """Regression (Paseo E2E): turn 2's model context must include turn 1.
+
+    The old seed-first-turn-only scheme rebuilt the agent with a fresh
+    checkpointer each turn and passed base=[] on turn 2 — cross-turn memory
+    silently broke unless continue-as-new re-seeded at the boundary.
+    """
+    _configure()
+    _RecordingModel.calls = []
+    provider_calls = _RecordingModel.calls
+    plugin = DeepAgentsPlugin(
+        model_provider=lambda name: _RecordingModel(),
+        streaming_topic="acp",
+        passthrough_modules=["acp_temporal_bridge"],
+    )
+    async with await _workflow_env() as env, Worker(
+        env.client,
+        task_queue="t",
+        workflows=[AgentSession],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            AgentSession.run,
+            args=[_session_start(), None, None],
+            id=session_workflow_id(SESSION_ID),
+            task_queue="t",
+        )
+        await handle.execute_update(
+            AgentSession.prompt, PromptIn(text="remember: XYZZY-marker")
+        )
+        _, _, end1 = await asyncio.wait_for(
+            _collect_until_turn_end(env.client, 0), timeout=30
+        )
+        await handle.execute_update(
+            AgentSession.prompt, PromptIn(text="what did I ask you to remember?")
+        )
+        _, _, _ = await asyncio.wait_for(
+            _collect_until_turn_end(env.client, end1), timeout=30
+        )
+
+    assert len(provider_calls) >= 2, provider_calls
+    turn2 = provider_calls[-1]
+    assert "XYZZY-marker" in turn2, f"turn 2 forgot turn 1: {turn2[:500]!r}"
