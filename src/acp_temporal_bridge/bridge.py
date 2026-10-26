@@ -87,7 +87,16 @@ def _bridge_version() -> str:
         return "0.0.0"
 TASK_QUEUE = os.environ.get("ACP_BRIDGE_TASK_QUEUE", "durable-agents")
 # Replay buffer bound: a loaded session replays at most this many events.
-REPLAY_MAX_ITEMS = 5000
+# Emergency brake against a flooding turn (the 2026-10-26 flood published
+# 16,401 items in one turn). Raised 5k → 50k now that the flood sources are
+# fixed upstream (no-op filter + tool-arg coalescing at the model seam):
+# legitimate tool-dense turns were landing uncomfortably close to 2,292
+# kept items, and this guard halts REAL turns when it fires.
+# REMOVAL PLAN: this guard is scaffolding for the flood era — once a few
+# weeks of production traffic show the flooding has actually stopped
+# (stream items per turn staying well under this bound), delete it
+# entirely; it exists to bound blast radius, not to be load-bearing.
+REPLAY_MAX_ITEMS = 50000
 # History render bound: a load_session replays at most this many transcript
 # messages (oldest are dropped — the newest turns matter most on reattach).
 REPLAY_TRANSCRIPT_MESSAGES = 200

@@ -357,7 +357,7 @@ class AgentSession:
             args = [start, state, transcript]
         try:
             workflow.continue_as_new(args=args)
-        except Exception:
+        except Exception:  # noqa: BLE001 — handled: log + retry with minimal tail
             workflow.logger.exception(
                 "bounded CAN rejected; retrying with the minimal stream tail"
             )
