@@ -61,6 +61,9 @@ def configure(
     default_spec: SessionSpec | None = None,
 ) -> None:
     """Set the host seams. Call once at import time (see module docstring)."""
+    from . import _delta
+
+    _delta.install()  # idempotent: model-call input delta protocol (Phase 1b)
     global _tool_builder, _interrupt_compiler, _backend_builder, _default_spec
     if tool_builder is not None:
         _tool_builder = tool_builder

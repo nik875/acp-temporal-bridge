@@ -15,6 +15,10 @@ Durability contract (DeepAgents-in-Temporal):
     transcript is a plain message-dict list carried across continue-as-new
     (CAN) — at turn boundaries AND mid-turn (see _CanGuardModel), so the
     in-memory checkpointer is disposable.
+  - Model-call activity inputs shrink to content-addressed delta markers
+    (_delta.install, wired via configure()) so history grows by ~1 KB per
+    model call instead of the full conversation; cache misses re-dispatch
+    the full input (worker restarts are the only miss source).
   - Streaming: the plugin's streaming activity (DeepAgentsPlugin
     streaming_topic=<STREAM_TOPIC>) pushes model deltas to the workflow's
     WorkflowStream; the workflow itself publishes tool/plan/turn events on the
