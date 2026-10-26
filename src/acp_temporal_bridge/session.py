@@ -747,6 +747,17 @@ class AgentSession:
     def pending_approval(self) -> policy.PendingApproval | None:
         return self._pending
 
+    @workflow.query
+    def turn_active(self) -> bool:
+        """True while a turn task is in flight.
+
+        Read by the bridge's cancel watchdog (bridge.py): a cancel whose
+        turn is STILL reported active after the grace window — or whose
+        query cannot be answered at all, which is what a wedged worker
+        looks like — escalates to a server-side terminate.
+        """
+        return self._turn_task is not None and not self._turn_task.done()
+
     @workflow.update
     async def resolve_approval(self, decision: dict[str, str | None]) -> None:
         action = decision.get("action", "")
