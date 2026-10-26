@@ -6,7 +6,9 @@ AgentSession workflows.
 Mapping (session_id == Temporal workflow_id minus the configured prefix):
     initialize          -> capabilities (load_session supported)
     new_session         -> start_workflow(AgentSession, id="<prefix><sid>")
-    load_session        -> verify workflow alive; replay offset resets to 0
+    load_session        -> verify workflow alive; render transcript history
+                           as message chunks, then tail the stream live from
+                           the head (in-flight turns + pending gates)
     list_sessions       -> Temporal workflow-id query (prefix match)
     prompt              -> execute_update(prompt) then stream replay until
                            turn_end; returns PromptResponse(stop_reason)
@@ -16,8 +18,10 @@ Mapping (session_id == Temporal workflow_id minus the configured prefix):
 Streaming: the workflow publishes every event (model deltas, tool/plan/turn
 boundaries) on WorkflowStream topic ``acp``. The bridge subscribes from its
 per-session offset — the durable log IS the replay source (no checkpointer).
-Reconnect/load_session rewinds to 0 and the bridge re-sends everything as ACP
-session/update notifications; the client renders the replay like live output.
+Reconnect/load_session renders the durable transcript (user + assistant
+messages) to the client immediately, then tails the stream from the head in
+the background, so a reattached client sees history AND a turn that was
+mid-flight when the connection dropped.
 
 Runs wherever the host points it (typically beside the worker): egress needs
 the Temporal frontend only; ingress is one TCP port behind whatever network
@@ -55,6 +59,7 @@ from acp.schema import (
     ToolCallProgress,
     ToolCallStart,
     ToolCallUpdate,
+    UserMessageChunk,
 )
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 
@@ -83,6 +88,9 @@ def _bridge_version() -> str:
 TASK_QUEUE = os.environ.get("ACP_BRIDGE_TASK_QUEUE", "durable-agents")
 # Replay buffer bound: a loaded session replays at most this many events.
 REPLAY_MAX_ITEMS = 5000
+# History render bound: a load_session replays at most this many transcript
+# messages (oldest are dropped — the newest turns matter most on reattach).
+REPLAY_TRANSCRIPT_MESSAGES = 200
 # ACP stop reasons are a closed vocabulary; anything else on the durable
 # turn_end (e.g. "error") is surfaced as a prompt failure, never silently
 # mapped onto a fake success.
@@ -245,6 +253,9 @@ class BridgeAgent:
         # ACP notifications carry no response, so prompt() owns the offset
         # bookkeeping for its session; cancel needs the same map read-only.
         self._offsets: dict[str, int] = {}
+        # Per-session background tail tasks spawned by load_session: they
+        # stream an in-flight turn to the reattached client until turn_end.
+        self._tail_tasks: dict[str, asyncio.Task[None]] = {}
 
     # -- ACP lifecycle -------------------------------------------------------
 
@@ -295,9 +306,100 @@ class BridgeAgent:
     ) -> LoadSessionResponse:
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
         await handle.describe()  # raises if gone
-        # Replay the whole durable log on the next prompt/attach.
-        self._offsets[session_id] = 0
+        # A reattaching client (crash, pod roll, client restart) must see the
+        # conversation NOW, not on its next prompt: until session/updates
+        # arrive, the client renders an empty "start chatting with this
+        # agent" session. Two replay sources, split to avoid double-render:
+        #   1. the durable transcript (human + AI text, CAN-surviving)
+        #      renders the full history as message chunks, then
+        #   2. the stream log is tailed LIVE from the head — covers an
+        #      in-flight turn (pod died mid-prompt; the turn kept running
+        #      in Temporal) and any pending approval gate.
+        # Offsets then point at the head, so the next prompt() replays
+        # nothing old.
+        await self._replay_transcript(session_id, handle)
+        head = await self._stream_head(handle)
+        self._offsets[session_id] = head
+        self._spawn_tail_task(session_id, handle, head)
         return LoadSessionResponse(session_id=session_id)
+
+    async def _replay_transcript(
+        self, session_id: str, handle: tc.WorkflowHandle
+    ) -> None:
+        """Render durable transcript history as ACP message-chunk updates."""
+        try:
+            tail = await handle.query(
+                AgentSession.transcript_tail, REPLAY_TRANSCRIPT_MESSAGES
+            )
+        except tc.RPCError:
+            return  # gone / query timeout: nothing to render
+        for dump in (tail or {}).get("transcript", []) or []:
+            text = _lc_message_text(dump)
+            if not text:
+                continue
+            ids = dump.get("id") or []
+            if "HumanMessage" in ids:
+                update: Any = UserMessageChunk(
+                    session_update="user_message_chunk",
+                    content=text_block(text),
+                )
+            elif "AIMessage" in ids:
+                update = AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=text_block(text),
+                )
+            else:
+                continue  # tool/system messages: not client-renderable history
+            await self._client.session_update(session_id, update)
+
+    async def _stream_head(self, handle: tc.WorkflowHandle) -> int:
+        try:
+            return await handle.query(AgentSession.stream_head)
+        except tc.RPCError:
+            return 0
+
+    def _spawn_tail_task(
+        self, session_id: str, handle: tc.WorkflowHandle, from_offset: int
+    ) -> None:
+        """Tail the stream log live from `from_offset` in the background.
+
+        One task per session per connection; a re-spawn cancels any
+        previous tail (a second load_session means a fresh reattach).
+        """
+        existing = self._tail_tasks.get(session_id)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        self._tail_tasks[session_id] = asyncio.create_task(
+            self._tail_stream(session_id, handle, from_offset)
+        )
+
+    async def _tail_stream(
+        self, session_id: str, handle: tc.WorkflowHandle, offset: int
+    ) -> None:
+        stream = WorkflowStreamClient.create(
+            self._temporal, session_workflow_id(session_id)
+        )
+        count = 0
+        async for item in stream.subscribe(STREAM_TOPIC, from_offset=offset):
+            count += 1
+            if count > REPLAY_MAX_ITEMS:
+                # Degenerate/flooded tail: give up quietly. The next
+                # prompt() replays from the tracked offset and its own
+                # overflow guard raises honestly.
+                break
+            data = getattr(item, "data", None)
+            if isinstance(data, dict) and data.get("kind") == "turn_end":
+                self._offsets[session_id] = getattr(item, "offset", offset) + 1
+                return
+            if isinstance(data, dict) and data.get("kind") == "approval_request":
+                # A gate that was pending when the client dropped: it must
+                # be re-asked now that the client is back.
+                await self._resolve_gate(session_id, handle, data)
+                self._offsets[session_id] = getattr(item, "offset", offset) + 1
+                continue
+            for update in translate_stream_item(item):
+                await self._client.session_update(session_id, update)
+            self._offsets[session_id] = getattr(item, "offset", offset) + 1
 
     async def list_sessions(self, cursor: Any = None, **kwargs: Any) -> ListSessionsResponse:
         sessions: list[SessionInfo] = []
@@ -329,6 +431,12 @@ class BridgeAgent:
         )
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
         await handle.execute_update(AgentSession.prompt, PromptIn(text=text))
+        # A load_session tail may still be streaming an in-flight turn to
+        # this client; drain it (through turn_end) before subscribing, or
+        # both loops would send the same items twice.
+        tail = self._tail_tasks.get(session_id)
+        if tail is not None and not tail.done():
+            await tail
         offset = self._offsets.get(session_id, 0)
         stop_reason = "end_turn"
         stream = WorkflowStreamClient.create(

@@ -512,6 +512,18 @@ class AgentSession:
         }
 
     @workflow.query
+    def stream_head(self) -> int:
+        """Current stream head (global offset of the next published item).
+
+        The bridge uses this on load_session to start live tailing exactly
+        where the durable history ends, so a reattached client gets prior
+        turns rendered once (from the transcript) and any in-flight turn
+        streamed from the head onward (no double-render).
+        """
+        state = self._stream.get_state()
+        return state.base_offset + len(state.log)
+
+    @workflow.query
     def pending_approval(self) -> policy.PendingApproval | None:
         return self._pending
 
