@@ -35,6 +35,7 @@ import contextlib
 import json
 import os
 import uuid
+from datetime import timedelta
 from typing import Any, get_args
 
 import temporalio.client as tc
@@ -97,6 +98,25 @@ TASK_QUEUE = os.environ.get("ACP_BRIDGE_TASK_QUEUE", "durable-agents")
 # (stream items per turn staying well under this bound), delete it
 # entirely; it exists to bound blast radius, not to be load-bearing.
 REPLAY_MAX_ITEMS = 50000
+# Interrupt full-stop watchdog: session/cancel normally kills the turn
+# cooperatively (AgentSession.cancel update -> turn task cancelled ->
+# turn_end stop_reason="cancelled") and the durable session survives.
+# But the update only takes effect if the workflow machinery actually
+# processes it. When it doesn't (wedged worker, lost update), the turn
+# runs forever, the prompt RPC never returns, and Paseo wedges the
+# session as "A foreground turn is already active" — its own force-cancel
+# (ack timeout ~2s) only repairs the DAEMON's view, never the agent.
+# After this grace window the bridge checks the workflow's turn_active
+# query; still alive — or the query itself unanswerable, which is what a
+# wedged worker looks like — the workflow is TERMINATED server-side.
+# Terminate (unlike workflow cancel) needs no live worker, and failing
+# the in-flight prompt() fast is exactly the terminal event the daemon's
+# agent-manager needs to un-wedge. Cost: the killed session's transcript
+# is lost — that is the "interrupt kills the agent, full stop" contract,
+# and it only fires when the cooperative path already failed.
+CANCEL_KILL_AFTER_SECS = float(
+    os.environ.get("ACP_BRIDGE_CANCEL_KILL_AFTER_SECS", "5")
+)
 # History render bound: a load_session replays at most this many transcript
 # messages (oldest are dropped — the newest turns matter most on reattach).
 REPLAY_TRANSCRIPT_MESSAGES = 200
@@ -296,6 +316,9 @@ class BridgeAgent:
         # Per-session background tail tasks spawned by load_session: they
         # stream an in-flight turn to the reattached client until turn_end.
         self._tail_tasks: dict[str, asyncio.Task[None]] = {}
+        # Cancel watchdogs (cancel()): escalate to a server-side terminate
+        # when the cooperative cancel didn't kill the turn in time.
+        self._cancel_watchdogs: set[asyncio.Task[None]] = set()
 
     async def aclose(self) -> None:
         """Shut down per-connection state; called when the ACP client drops.
@@ -312,6 +335,15 @@ class BridgeAgent:
         if self._tail_tasks:
             await asyncio.gather(*self._tail_tasks.values(), return_exceptions=True)
         self._tail_tasks.clear()
+        # Watchdogs die with the connection: on disconnect the durability
+        # contract wins (the client may reconnect and reattach to the
+        # session — a late terminate would murder a legitimately resumed
+        # session mid-turn).
+        for task in self._cancel_watchdogs:
+            task.cancel()
+        if self._cancel_watchdogs:
+            await asyncio.gather(*self._cancel_watchdogs, return_exceptions=True)
+        self._cancel_watchdogs.clear()
         for session_id in self._created - self._prompted:
             handle = self._temporal.get_workflow_handle(
                 session_workflow_id(session_id)
@@ -612,11 +644,48 @@ class BridgeAgent:
         await handle.execute_update(AgentSession.resolve_approval, payload)
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
-        """ACP notification: client asked to cancel the in-flight turn."""
+        """ACP notification: client asked to cancel the in-flight turn.
+
+        Two-phase. Phase 1 is the cooperative update (unchanged): the
+        workflow cancels its turn task, the run loop records turn_end
+        stop_reason="cancelled", and the durable session survives. Phase
+        2 is a watchdog: if the turn is still alive after
+        CANCEL_KILL_AFTER_SECS — or the turn_active query cannot even be
+        answered, which is what a wedged worker looks like — the workflow
+        is TERMINATED server-side. See CANCEL_KILL_AFTER_SECS for why.
+        """
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
         # Fire-and-forget semantics: prompt() sees turn_end(stop_reason=
         # "cancelled") on the stream and returns.
         asyncio.create_task(handle.execute_update(AgentSession.cancel))
+        watchdog = asyncio.create_task(self._cancel_watchdog(handle))
+        self._cancel_watchdogs.add(watchdog)
+        watchdog.add_done_callback(self._cancel_watchdogs.discard)
+
+    async def _cancel_watchdog(self, handle: tc.WorkflowHandle) -> None:
+        """Escalate an unanswered cancel to a server-side terminate."""
+        await asyncio.sleep(CANCEL_KILL_AFTER_SECS)
+        alive: bool | None = None
+        # Fail closed: the query is purely advisory, so ANY failure (wedged
+        # worker, RPC timeout, workflow already gone) counts as "cannot
+        # prove the turn ended" and escalates to the terminate.
+        with contextlib.suppress(Exception):
+            alive = await handle.query(
+                AgentSession.turn_active, rpc_timeout=timedelta(seconds=5)
+            )
+        if alive is False:
+            # Cooperative cancel won: turn ended, session and transcript
+            # survive. (This is the normal path; the watchdog is a no-op.)
+            return
+        # alive is True (worker healthy, turn still running — the update
+        # never took effect) or None (query failed: wedged worker). Either
+        # way the turn is out of cooperative reach; terminate needs no
+        # worker at all and fails the in-flight prompt() immediately.
+        with contextlib.suppress(tc.RPCError):
+            await handle.terminate(
+                reason="cancel watchdog: turn survived cooperative cancel",
+                rpc_timeout=timedelta(seconds=5),
+            )
 
 
 # ---------------------------------------------------------------------------
