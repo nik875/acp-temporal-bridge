@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "acp-temporal-bridge"
-version = "0.1.12"
+version = "0.1.13"
 description = "Agent Client Protocol bridge for durable agent sessions on Temporal — one workflow per session, replayable, restart-safe."
 readme = "README.md"
 license = "MIT"
