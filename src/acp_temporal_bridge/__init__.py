@@ -7,7 +7,7 @@ sessions when their PRs land. See README.md for the setup contract
 (:func:`configure` must be called by the host at import time).
 """
 
-from ._config import SessionSpec, configure
+from ._config import SessionSpec, configure, get_backend_builder
 from .bridge import BridgeAgent, ReplayOverflowError, main, serve, translate_stream_item
 from .policy import ApprovalDecision, PendingApproval, build_interrupt_on
 from .session import (
@@ -33,6 +33,7 @@ __all__ = [
     "build_interrupt_on",
     "configure",
     "fetch_merged_prs",
+    "get_backend_builder",
     "main",
     "serve",
     "session_workflow_id",

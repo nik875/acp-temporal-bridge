@@ -19,6 +19,17 @@ TOOL_BUILDER = Callable[[list[str]], list[Any]]
 INTERRUPT_COMPILER = Callable[[list[str]], dict[str, bool]]
 """names -> {tool_name: should_interrupt} map for DeepAgents interrupt_on."""
 
+BACKEND_BUILDER = Callable[[], Any]
+"""() -> BackendProtocol | None — the filesystem backend for the DeepAgents
+built-in tools (ls/read_file/write_file/edit_file/glob/grep).
+
+Called inside the session workflow. In-workflow construction is correct for a
+``TemporalBackend``-wrapped backend: the wrapper registers its inner backend
+worker-side at build time and every real-I/O op dispatches out as a durable
+``deepagents.backend_op`` activity. Return None (or omit the seam) to keep
+deepagents' default ``StateBackend`` — files live in workflow state, not on
+any disk. Must be deterministic under replay."""
+
 
 @dataclass
 class SessionSpec:
@@ -38,6 +49,7 @@ class SessionSpec:
 
 _tool_builder: TOOL_BUILDER | None = None
 _interrupt_compiler: INTERRUPT_COMPILER | None = None
+_backend_builder: BACKEND_BUILDER | None = None
 _default_spec: SessionSpec | None = None
 
 
@@ -45,16 +57,24 @@ def configure(
     *,
     tool_builder: TOOL_BUILDER | None = None,
     interrupt_compiler: INTERRUPT_COMPILER | None = None,
+    backend_builder: BACKEND_BUILDER | None = None,
     default_spec: SessionSpec | None = None,
 ) -> None:
     """Set the host seams. Call once at import time (see module docstring)."""
-    global _tool_builder, _interrupt_compiler, _default_spec
+    global _tool_builder, _interrupt_compiler, _backend_builder, _default_spec
     if tool_builder is not None:
         _tool_builder = tool_builder
     if interrupt_compiler is not None:
         _interrupt_compiler = interrupt_compiler
+    if backend_builder is not None:
+        _backend_builder = backend_builder
     if default_spec is not None:
         _default_spec = default_spec
+
+
+def get_backend_builder() -> BACKEND_BUILDER | None:
+    """Optional seam: None means "use deepagents' default (StateBackend)"."""
+    return _backend_builder
 
 
 def get_tool_builder() -> TOOL_BUILDER:
