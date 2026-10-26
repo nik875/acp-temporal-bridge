@@ -13,7 +13,8 @@ Durability contract (DeepAgents-in-Temporal):
     (replay-unsafe). Temporal history IS the durable store.
   - Multi-turn memory lives in the in-run InMemorySaver; the canonical
     transcript is a plain message-dict list carried across continue-as-new
-    (CAN) — turn-boundary only, so the in-memory checkpointer is disposable.
+    (CAN) — at turn boundaries AND mid-turn (see _CanGuardModel), so the
+    in-memory checkpointer is disposable.
   - Streaming: the plugin's streaming activity (DeepAgentsPlugin
     streaming_topic=<STREAM_TOPIC>) pushes model deltas to the workflow's
     WorkflowStream; the workflow itself publishes tool/plan/turn events on the
@@ -46,6 +47,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from langgraph.types import Command
     from temporalio.deepagents import create_temporal_deep_agent
+    from temporalio.deepagents._model import TemporalModel
 
     # Import the seam + policy types here too: the sandbox must reuse the
     # main-process module objects (with their configured state), not re-import
@@ -125,6 +127,73 @@ class SessionStart:
     # Test/driver hook: continue-as-new deterministically after N turns.
     # History growth otherwise triggers CAN via is_continue_as_new_suggested().
     force_can_after_turns: int = 0
+    # Test/driver hook: trip the MID-TURN CAN guard on the first model call of
+    # the first turn (simulating a history-budget breach without waiting for
+    # real history growth). The resumed turn does not re-trip it.
+    force_mid_turn_can: bool = False
+    # Set internally by the mid-turn CAN path: the successor run must re-enter
+    # the interrupted turn from the carried transcript instead of waiting for
+    # a new prompt. Never set by clients.
+    resume_pending_turn: bool = False
+
+
+class MidTurnContinueAsNew(Exception):
+    """Raised inside the agent loop when history budget demands a CAN.
+
+    Control-flow, not a failure: run() catches this and executes the same
+    bounded continue-as-new used at turn boundaries, resuming the turn from
+    the carried transcript in the successor run. Never escapes the workflow.
+    """
+
+
+class _CanGuardModel(TemporalModel):
+    """TemporalModel that trips continue-as-new MID-turn.
+
+    The plugin's own CAN (run_deep_agent's continue_as_new_after) only fires
+    after ``ainvoke`` returns — a single long turn (hundreds of model calls,
+    each embedding the whole conversation in its activity input) can overflow
+    the server's history limit with no boundary in sight. Measured 2026-10-26
+    (session sysadmin-61be2651056d): 71 MB history, 96% of it 145 growing
+    `invoke_model_streaming` inputs — terminated by the history service
+    mid-activity.
+
+    Checking the server's own suggestion (the same predicate run() already
+    trusts at turn boundaries) before each model activity gives the turn a
+    pressure valve. The check is a free local read, deterministic under
+    replay (the flag travels on each workflow activation).
+    """
+
+    # Test/driver hook: trip unconditionally (see SessionStart.force_mid_turn_can).
+    force: bool = False
+
+    async def _agenerate(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        self._check_budget()
+        return await super()._agenerate(
+            messages, stop=stop, run_manager=run_manager, **kwargs
+        )
+
+    async def _astream(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        self._check_budget()
+        async for chunk in super()._astream(
+            messages, stop=stop, run_manager=run_manager, **kwargs
+        ):
+            yield chunk
+
+    def _check_budget(self) -> None:
+        if self.force or workflow.info().is_continue_as_new_suggested():
+            raise MidTurnContinueAsNew()
 
 
 @dataclasses.dataclass
@@ -274,10 +343,21 @@ class AgentSession:
             raise ApplicationError("no tools registered", non_retryable=True)
         self._transcript = list(transcript or [])
         while True:
-            await workflow.wait_condition(lambda: bool(self._queue))
-            prompt = self._queue.pop(0)
+            if start.resume_pending_turn:
+                # Mid-turn CAN successor: re-enter the interrupted turn from
+                # the carried transcript (no new prompt). The flag is
+                # one-shot — cleared so the resumed turn ends normally.
+                start.resume_pending_turn = False
+                task = asyncio.create_task(
+                    self._turn(run, None, start.force_mid_turn_can)
+                )
+            else:
+                await workflow.wait_condition(lambda: bool(self._queue))
+                prompt = self._queue.pop(0)
+                task = asyncio.create_task(
+                    self._turn(run, prompt.text, start.force_mid_turn_can)
+                )
             self._turn_count += 1
-            task = asyncio.create_task(self._turn(run, prompt.text))
             self._turn_task = task
             janitor = asyncio.create_task(self._stream_janitor())
             try:
@@ -285,6 +365,16 @@ class AgentSession:
                 stop_reason = "end_turn"
             except asyncio.CancelledError:
                 stop_reason = "cancelled"
+            except MidTurnContinueAsNew:
+                # History budget hit INSIDE the turn: continue-as-new now,
+                # resuming the turn from the transcript in the successor run.
+                # The turn never published turn_end, so the client's stream
+                # subscription follows the CAN chain transparently (the
+                # WorkflowStreamClient follows continue-as-new natively) and
+                # the turn continues as far as the client can tell.
+                stop_reason = "end_turn"  # not published; marker only
+                start.resume_pending_turn = True
+                self._continue_as_new(start)
             except Exception:  # noqa: BLE001 — any turn failure keeps the session alive
                 # A failed turn must not kill the session workflow: the
                 # durable stream records stop_reason="error" (the bridge
@@ -297,12 +387,15 @@ class AgentSession:
                 self._turn_task = None
                 janitor.cancel()
                 await asyncio.gather(janitor, return_exceptions=True)
+            # Unreachable after the mid-turn CAN path (_continue_as_new
+            # raises out of run()): the resumed turn publishes its own
+            # turn_end when it actually completes.
             _publish(self._stream, {"kind": "turn_end", "stop_reason": stop_reason})
             if (
                 start.force_can_after_turns
                 and self._turn_count >= start.force_can_after_turns
             ) or workflow.info().is_continue_as_new_suggested():
-                # CAN only at turn boundaries. The stream log + transcript are
+                # CAN at the turn boundary. The stream log + transcript are
                 # carried; the in-memory checkpointer is discarded by design.
                 self._continue_as_new(start)
 
@@ -378,28 +471,51 @@ class AgentSession:
             for p in workflow.payload_converter().to_payloads(args)
         )
 
-    async def _turn(self, run: SessionSpec, text: str) -> None:
-        """One agent turn: stream events to the bridge topic, keep transcript."""
-        # Optional host seam: a real filesystem backend for the DeepAgents
-        # built-in tools. None (no seam configured) keeps the StateBackend
-        # default — virtual files in workflow state. The builder runs in-
-        # workflow; a TemporalBackend wrapper's ops dispatch out as activities.
-        backend = get_backend_builder()() if get_backend_builder() else None
-        agent = create_temporal_deep_agent(
+    async def _turn(
+        self, run: SessionSpec, text: str | None, force_mid_turn: bool = False
+    ) -> None:
+        """One agent turn: stream events to the bridge topic, keep transcript.
+
+        `text=None` resumes a turn interrupted by a mid-turn continue-as-new:
+        the conversation is seeded from the carried transcript alone (the
+        original prompt and every prior message are already in it), and the
+        model simply continues where it left off.
+        """
+        model = _CanGuardModel(
             model=run.model,
-            system_prompt=run.system_prompt,
-            tools=get_tool_builder()(list(run.tools)),
-            backend=backend,
-            interrupt_on=policy.build_interrupt_on(list(run.tools)),
-            checkpointer=self._checkpointer(),
+            # The test/driver force hook trips only on a real prompt turn —
+            # a resumed turn must be able to complete without re-tripping.
+            force=(text is not None) and force_mid_turn,
             activity_options={
                 "start_to_close_timeout": timedelta(seconds=MODEL_START_TO_CLOSE_SECS),
                 "heartbeat_timeout": timedelta(seconds=MODEL_HEARTBEAT_TIMEOUT_SECS),
                 "retry_policy": RetryPolicy(maximum_attempts=MODEL_MAX_ATTEMPTS),
             },
         )
+        # Optional host seam: a real filesystem backend for the DeepAgents
+        # built-in tools. None (no seam configured) keeps the StateBackend
+        # default — virtual files in workflow state. The builder runs in-
+        # workflow; a TemporalBackend wrapper's ops dispatch out as activities.
+        backend = get_backend_builder()() if get_backend_builder() else None
+        agent = create_temporal_deep_agent(
+            model=model,
+            system_prompt=run.system_prompt,
+            tools=get_tool_builder()(list(run.tools)),
+            backend=backend,
+            interrupt_on=policy.build_interrupt_on(list(run.tools)),
+            checkpointer=self._checkpointer(),
+        )
         config = {"configurable": {"thread_id": workflow.info().workflow_id}}
-        human = HumanMessage(content=text)
+        human: HumanMessage | None = None
+        if text is not None:
+            human = HumanMessage(content=text)
+        elif not self._transcript:
+            # Resume with nothing to resume FROM: a caller error, not a
+            # model call — fail the turn honestly.
+            raise ApplicationError(
+                "mid-turn resume requested but no carried transcript",
+                non_retryable=True,
+            )
         # The checkpointer above is fresh per turn (the agent is rebuilt per
         # turn), so ALL cross-turn memory must come from the canonical
         # transcript: seed every turn with the full prior conversation. The
@@ -414,7 +530,7 @@ class AgentSession:
         turn_messages: list[BaseMessage] = []
         interrupt: Any = None
         try:
-            gen_input: Any = {"messages": base + [human]}
+            gen_input: Any = {"messages": base if human is None else base + [human]}
             while True:
                 interrupt = None
                 async for item in agent.astream(
@@ -464,8 +580,10 @@ class AgentSession:
                 )
                 gen_input = Command(resume=decision.to_resume_payload())
         finally:
-            # On cancel, keep whatever of the turn already completed.
-            self._transcript = self._transcript + _serialize([human] + turn_messages)
+            # On cancel or mid-turn CAN, keep whatever of the turn already
+            # completed (the resumed turn re-seeds from this transcript).
+            produced = turn_messages if human is None else [human] + turn_messages
+            self._transcript = self._transcript + _serialize(produced)
 
     def _checkpointer(self) -> Any:
         from langgraph.checkpoint.memory import InMemorySaver
