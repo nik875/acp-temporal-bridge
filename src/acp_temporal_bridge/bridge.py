@@ -241,6 +241,7 @@ def translate_stream_item(item: Any) -> list[Any]:
                 title=str(data.get("name", "tool")),
                 kind="execute",
                 status="in_progress",
+                raw_input=data.get("args"),
             )
         ]
     if kind == "tool_end":
@@ -251,6 +252,7 @@ def translate_stream_item(item: Any) -> list[Any]:
                 tool_call_id=data.get("id") or "",
                 status="completed",
                 content=[tool_content(text_block(output))] if output else [],
+                raw_output=output or None,
             )
         ]
     if kind == "plan":
