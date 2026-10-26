@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import os
 from datetime import timedelta
 from typing import Any
@@ -68,6 +69,17 @@ MODEL_HEARTBEAT_TIMEOUT_SECS = int(
 # past TMPRL1103). Bounded attempts + the bridge's ReplayOverflowError
 # keep the blast radius one failed turn.
 MODEL_MAX_ATTEMPTS = int(os.environ.get("ACP_BRIDGE_MODEL_MAX_ATTEMPTS", "3"))
+# Bound the state carried across continue-as-new. Temporal rejects oversized
+# payloads (TMPRL1103) and a CAN that trips that limit fails the workflow
+# task deterministically on every retry — permanently wedging the session:
+# no prompt, poll, or signal is ever processed again (observed 2026-10-26:
+# one verbose turn streamed a 4.1MB log of per-token entries; the CAN at the
+# turn boundary then exceeded the ~2MB server limit and every task retry
+# died at the same step). Stay far under the server limit. Env-overridable
+# so a server with a raised limit can carry more.
+CAN_ARGS_BUDGET_BYTES = int(os.environ.get("ACP_BRIDGE_CAN_BUDGET_BYTES", "1200000"))
+CAN_MIN_TAIL_ENTRIES = 50  # never carry fewer stream entries than this
+TOOL_OUTPUT_TRANSCRIPT_CAP = 8000  # transcript tool outputs at CAN time
 MAX_GATES_PER_RUN = 10
 # Workflow ids are prefixed so external components can distinguish session
 # workflows from others on the queue.
@@ -144,6 +156,73 @@ def _text_of(content: Any) -> str:
     return str(content)
 
 
+def _cap_json(value: Any, cap: int) -> Any:
+    """Bound a published value's serialized size (display-only entries:
+    the executing tools always see the real args from graph state)."""
+    try:
+        s = json.dumps(value)
+    except (TypeError, ValueError):
+        s = str(value)
+    if len(s) <= cap:
+        return value
+    return {"truncated_to": cap, "head": s[:cap]}
+
+
+def _bound_transcript(
+    transcript: list[dict[str, Any]],
+    output_cap: int = TOOL_OUTPUT_TRANSCRIPT_CAP,
+) -> list[dict[str, Any]]:
+    """Truncate tool outputs inside a canonical-transcript copy.
+
+    Transcript entries are message_to_dict() dicts ({"type": "tool",
+    "data": {"content": ...}}). Full tool outputs are the transcript's
+    growth driver — the model only needs recent outputs verbatim, and the
+    published stream already caps at 4000 chars. Deterministic in d, so
+    replay-safe.
+    """
+    bounded: list[dict[str, Any]] = []
+    for d in transcript:
+        if (
+            isinstance(d, dict)
+            and d.get("type") == "tool"
+            and isinstance(d.get("data"), dict)
+            and isinstance(d["data"].get("content"), str)
+            and len(d["data"]["content"]) > output_cap
+        ):
+            content = d["data"]["content"]
+            data = dict(d["data"])
+            data["content"] = (
+                content[:output_cap]
+                + f"...[truncated, {len(content) - output_cap} chars dropped]"
+            )
+            bounded.append({**d, "data": data})
+        else:
+            bounded.append(d)
+    return bounded
+
+
+def _stream_state_with_tail(
+    state: WorkflowStreamState, keep: int
+) -> WorkflowStreamState:
+    """Carry only the newest `keep` log entries across CAN.
+
+    Offsets stay monotonic: base_offset advances with the dropped prefix.
+    Pollers that ask for a truncated offset get the SDK's TruncatedOffset
+    error and resync from the stream's new base offset automatically
+    (WorkflowStreamClient.subscribe handles this natively — offset 0 means
+    "from the beginning of whatever exists").
+    """
+    log = state.log
+    if keep >= len(log):
+        return state
+    drop = len(log) - keep
+    return WorkflowStreamState(
+        log=log[drop:],
+        base_offset=state.base_offset + drop,
+        publishers=state.publishers,
+    )
+
+
 @workflow.defn
 class AgentSession:
     @workflow.init
@@ -204,9 +283,56 @@ class AgentSession:
             ) or workflow.info().is_continue_as_new_suggested():
                 # CAN only at turn boundaries. The stream log + transcript are
                 # carried; the in-memory checkpointer is discarded by design.
-                workflow.continue_as_new(
-                    args=[start, self._stream.get_state(), self._transcript]
-                )
+                self._continue_as_new(start)
+
+    def _continue_as_new(self, start: SessionStart) -> None:
+        """CAN with bounded carried state (the TMPRL1103 wedge guard).
+
+        An unbounded CAN fails the workflow task deterministically on every
+        retry and permanently wedges the session — no prompt, poll, or
+        signal is ever processed again. The carried state is therefore
+        truncated until it fits the budget: transcript tool outputs first
+        (model memory affords caps), then the oldest stream entries (the
+        bridge resyncs across truncation natively). If a bounded CAN is
+        STILL rejected (measurement error / smaller server limit), fall
+        back to the minimal tail; only a second failure re-raises, and
+        that surfaces as a visible session error instead of a silent
+        infinite retry loop.
+        """
+        transcript = _bound_transcript(self._transcript)
+        state = self._stream.get_state()
+        args = [start, state, transcript]
+        total = self._can_size(args)
+        if total > CAN_ARGS_BUDGET_BYTES:
+            log = state.log
+            keep = len(log)
+            while keep > CAN_MIN_TAIL_ENTRIES and total > CAN_ARGS_BUDGET_BYTES:
+                total -= len(log[len(log) - keep].data or "")
+                keep -= 1
+            state = _stream_state_with_tail(state, keep)
+            args = [start, state, transcript]
+        try:
+            workflow.continue_as_new(args=args)
+        except Exception:
+            workflow.logger.exception(
+                "bounded CAN rejected; retrying with the minimal stream tail"
+            )
+            workflow.continue_as_new(
+                args=[
+                    start,
+                    _stream_state_with_tail(state, CAN_MIN_TAIL_ENTRIES),
+                    transcript,
+                ]
+            )
+
+    @staticmethod
+    def _can_size(args: list[Any]) -> int:
+        """Serialized size of the CAN args, measured exactly as the SDK
+        will send them. Deterministic — safe under replay."""
+        return sum(
+            len(p.data or b"")
+            for p in workflow.payload_converter().to_payloads(args)
+        )
 
     async def _turn(self, run: SessionSpec, text: str) -> None:
         """One agent turn: stream events to the bridge topic, keep transcript."""
@@ -343,7 +469,7 @@ class AgentSession:
                                     "kind": "tool_start",
                                     "id": tc.get("id") or "",
                                     "name": tc.get("name") or "tool",
-                                    "args": tc.get("args") or {},
+                                    "args": _cap_json(tc.get("args") or {}, 2000),
                                 },
                             )
 
