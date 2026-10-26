@@ -52,7 +52,7 @@ with workflow.unsafe.imports_passed_through():
     # fresh copies — configure() is called at host import time, before any
     # sandbox import, and a fresh sandbox copy would see None seams.
     from . import policy
-    from ._config import SessionSpec, get_tool_builder
+    from ._config import SessionSpec, get_backend_builder, get_tool_builder
 
 MODEL_START_TO_CLOSE_SECS = 600
 # Heartbeat the model activity so a slow/hung LLM call doesn't look dead.
@@ -380,10 +380,16 @@ class AgentSession:
 
     async def _turn(self, run: SessionSpec, text: str) -> None:
         """One agent turn: stream events to the bridge topic, keep transcript."""
+        # Optional host seam: a real filesystem backend for the DeepAgents
+        # built-in tools. None (no seam configured) keeps the StateBackend
+        # default — virtual files in workflow state. The builder runs in-
+        # workflow; a TemporalBackend wrapper's ops dispatch out as activities.
+        backend = get_backend_builder()() if get_backend_builder() else None
         agent = create_temporal_deep_agent(
             model=run.model,
             system_prompt=run.system_prompt,
             tools=get_tool_builder()(list(run.tools)),
+            backend=backend,
             interrupt_on=policy.build_interrupt_on(list(run.tools)),
             checkpointer=self._checkpointer(),
             activity_options={

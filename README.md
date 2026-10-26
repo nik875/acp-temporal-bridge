@@ -51,6 +51,11 @@ atb.configure(
     # optional: names -> {tool: bool} for DeepAgents interrupt_on (HITL
     # gates). Default: nothing gated.
     interrupt_compiler=my_app.build_interrupt_on,
+    # optional: () -> backend for the DeepAgents built-in file tools
+    # (ls/read_file/write_file/edit_file/glob/grep). Wrap real-I/O backends
+    # in temporalio.deepagents.TemporalBackend so every op runs as a durable
+    # activity. Default/None: StateBackend (files live in workflow state).
+    backend_builder=my_app.build_backend,
     # the spec every new session starts with
     default_spec=atb.SessionSpec(
         model="your-model-id",
