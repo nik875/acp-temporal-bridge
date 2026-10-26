@@ -5,6 +5,11 @@ durable log (10k+ items, no turn_end) and prompt() silently returned a
 fabricated ``end_turn``. Contract after the fix:
 
 * overflow without turn_end          -> ReplayOverflowError (never fake success)
+  AND the turn is halted workflow-side (cancel update) — stopping the
+  client's view is not enough; the turn must stop burning durable history
+* overflow with the halted turn's
+  turn_end behind it                 -> ReplayOverflowError, offsets drained
+  past the stale turn_end (next prompt replays from the post-turn boundary)
 * turn_end with out-of-vocabulary
   stop_reason (e.g. "error")         -> RequestError.internal_error
 * turn_end with a valid stop_reason  -> PromptResponse(stop_reason)
@@ -13,7 +18,7 @@ fabricated ``end_turn``. Contract after the fix:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from acp.exceptions import RequestError
@@ -30,8 +35,10 @@ class _Item:
 
 
 class _FakeHandle:
+    updates: ClassVar[list[Any]] = []
+
     async def execute_update(self, *args: Any, **kwargs: Any) -> None:
-        return None
+        _FakeHandle.updates.append(args[0] if args else None)
 
 
 class _FakeTemporal:
@@ -65,10 +72,11 @@ def _use_stream(monkeypatch: pytest.MonkeyPatch, items: list[_Item]) -> None:
     monkeypatch.setattr(bridge_mod, "WorkflowStreamClient", _Stream)
 
 
-async def test_overflow_raises_not_fake_end_turn(
+async def test_overflow_halts_turn_and_raises_not_fake_end_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A flooded log (no turn_end within REPLAY_MAX_ITEMS) must error out."""
+    """A flooded log (no turn_end within REPLAY_MAX_ITEMS) must be halted
+    workflow-side and error out — never a fabricated end_turn."""
     _use_stream(
         monkeypatch,
         [
@@ -79,6 +87,34 @@ async def test_overflow_raises_not_fake_end_turn(
     agent, _conn = _agent()
     with pytest.raises(ReplayOverflowError):
         await agent.prompt("s1", [])
+    # The halt actually reached the workflow (cancel update executed).
+    assert any(u is bridge_mod.AgentSession.cancel for u in _FakeHandle.updates)
+
+
+async def test_overflow_drains_past_halted_turn_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the guard halts the turn, the drain consumes through the halted
+    turn's turn_end so the NEXT prompt replays from the post-turn boundary
+    instead of tripping over the stale end."""
+    max_items = bridge_mod.REPLAY_MAX_ITEMS
+    _use_stream(
+        monkeypatch,
+        [
+            *(
+                _Item({"kind": "message", "text": "x"}, i)
+                for i in range(max_items + 1)
+            ),
+            _Item({"kind": "turn_end", "stop_reason": "cancelled"}, max_items + 1),
+        ],
+    )
+    agent, _conn = _agent()
+    with pytest.raises(ReplayOverflowError):
+        await agent.prompt("s1", [])
+    # Offsets advanced past the halted turn's turn_end...
+    assert agent._offsets["s1"] == max_items + 2
+    # ...and the halt reached the workflow.
+    assert any(u is bridge_mod.AgentSession.cancel for u in _FakeHandle.updates)
 
 
 async def test_unknown_stop_reason_raises_request_error(

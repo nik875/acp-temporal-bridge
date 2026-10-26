@@ -467,26 +467,39 @@ class BridgeAgent:
             self._temporal, session_workflow_id(session_id)
         )
         count = 0
+        halting = False
         async for item in stream.subscribe(STREAM_TOPIC, from_offset=offset):
             count += 1
-            if count > REPLAY_MAX_ITEMS:
-                # Never fake a completion: surface the anomaly as a prompt
-                # error. Offsets up to the last consumed item are kept, so a
-                # follow-up prompt resumes rather than replays from scratch.
-                raise ReplayOverflowError(
-                    f"session {session_id}: no turn_end after {REPLAY_MAX_ITEMS} "
-                    f"stream items (from offset {offset}) — turn still running "
-                    "or degenerate log; refusing to report end_turn"
-                )
             data = getattr(item, "data", None)
+            if count > REPLAY_MAX_ITEMS and not halting:
+                # Emergency brake (v0.1.8): stopping this client's view is
+                # NOT enough — the turn would keep streaming chunks into
+                # durable history (SSD burn) while nobody watches. Halt the
+                # turn workflow-side (the same update path as the client's
+                # cancel notification: the model activity is cancelled and
+                # the run loop records turn_end stop_reason="cancelled"),
+                # then keep consuming THIS stream silently through the
+                # halted turn's turn_end so the next prompt replays from
+                # the post-turn boundary instead of tripping over a stale
+                # end. The session stays alive; the user's next prompt
+                # resumes it. Never fake a completion: the error below
+                # still surfaces.
+                halting = True
+                await handle.execute_update(AgentSession.cancel)
+                continue
+            if halting:
+                # Drain: advance offsets, surface nothing.
+                self._offsets[session_id] = getattr(item, "offset", offset) + 1
+                if isinstance(data, dict) and data.get("kind") == "turn_end":
+                    break
+                continue
             if isinstance(data, dict) and data.get("kind") == "turn_end":
                 reason = data.get("stop_reason") or "end_turn"
                 if reason not in ACP_STOP_REASONS:
                     # e.g. "error" from a failed turn: the durable record is
                     # honest, the ACP surface is an error (StopReason is a
                     # closed Literal — pydantic would reject "error").
-                    raise RequestError.internal_error(
-                        {
+                    raise RequestError.internal_error(                        {
                             "details": (
                                 f"session {session_id}: turn ended with "
                                 f"stop_reason={reason!r}"
@@ -504,6 +517,15 @@ class BridgeAgent:
             for update in translate_stream_item(item):
                 await self._client.session_update(session_id, update)
             self._offsets[session_id] = getattr(item, "offset", offset) + 1
+        if halting:
+            # The halt drain ended without the halted turn's turn_end
+            # (degenerate log even after cancel). Never report a fake
+            # completion — surface the anomaly.
+            raise ReplayOverflowError(
+                f"session {session_id}: turn halted after {REPLAY_MAX_ITEMS} "
+                f"stream items (from offset {offset}) but no turn_end "
+                "followed the cancel — refusing to report end_turn"
+            )
         return PromptResponse(stop_reason=stop_reason)
 
     async def _resolve_gate(

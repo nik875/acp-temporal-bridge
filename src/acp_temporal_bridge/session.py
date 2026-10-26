@@ -66,8 +66,8 @@ MODEL_HEARTBEAT_TIMEOUT_SECS = int(
 # Cap model-activity retries. With no retry policy, Temporal retries
 # forever — a degenerate model streaming garbage floods the durable log
 # on every attempt (observed: 10k+ items in ~2.5 min, workflow poisoned
-# past TMPRL1103). Bounded attempts + the bridge's ReplayOverflowError
-# keep the blast radius one failed turn.
+# past TMPRL1103). Bounded attempts + the bridge's replay guard
+# (ReplayOverflowError) keep the blast radius one failed turn.
 MODEL_MAX_ATTEMPTS = int(os.environ.get("ACP_BRIDGE_MODEL_MAX_ATTEMPTS", "3"))
 # Bound the state carried across continue-as-new. Temporal rejects oversized
 # payloads (TMPRL1103) and a CAN that trips that limit fails the workflow
@@ -81,6 +81,24 @@ CAN_ARGS_BUDGET_BYTES = int(os.environ.get("ACP_BRIDGE_CAN_BUDGET_BYTES", "12000
 CAN_MIN_TAIL_ENTRIES = 50  # never carry fewer stream entries than this
 TOOL_OUTPUT_TRANSCRIPT_CAP = 8000  # transcript tool outputs at CAN time
 MAX_GATES_PER_RUN = 10
+# Mid-turn stream-log janitor: _stream_state_with_tail bounds what CAN
+# carries, but only at turn boundaries. A single long turn can still grow
+# the in-memory log without bound (the 2026-10-26 flood turn published
+# 16,401 entries — mostly no-op provider chunks, now filtered at the model
+# provider; the janitor is the backstop for ANY pathological source).
+# During each turn, a durable-timer loop trims the oldest entries once the
+# log passes the threshold, keeping the newest LOG_TRIM_KEEP. Offsets stay
+# monotonic (WorkflowStream.truncate); bridge pollers that fall behind
+# truncation resync natively (WorkflowStreamClient.subscribe handles the
+# TruncatedOffset error). These values exceed any legitimate turn by a
+# wide margin — 16,401 was 86% noise; real content was 2,292 entries.
+STREAM_LOG_TRIM_THRESHOLD = int(
+    os.environ.get("ACP_BRIDGE_STREAM_LOG_TRIM_THRESHOLD", "2000")
+)
+STREAM_LOG_TRIM_KEEP = int(os.environ.get("ACP_BRIDGE_STREAM_LOG_TRIM_KEEP", "1000"))
+STREAM_JANITOR_TICK_SECS = float(
+    os.environ.get("ACP_BRIDGE_STREAM_JANITOR_TICK_SECS", "20")
+)
 # Workflow ids are prefixed so external components can distinguish session
 # workflows from others on the queue.
 WORKFLOW_PREFIX = os.environ.get("ACP_BRIDGE_WORKFLOW_PREFIX", "agent-")
@@ -261,6 +279,7 @@ class AgentSession:
             self._turn_count += 1
             task = asyncio.create_task(self._turn(run, prompt.text))
             self._turn_task = task
+            janitor = asyncio.create_task(self._stream_janitor())
             try:
                 await task
                 stop_reason = "end_turn"
@@ -276,6 +295,8 @@ class AgentSession:
                 stop_reason = "error"
             finally:
                 self._turn_task = None
+                janitor.cancel()
+                await asyncio.gather(janitor, return_exceptions=True)
             _publish(self._stream, {"kind": "turn_end", "stop_reason": stop_reason})
             if (
                 start.force_can_after_turns
@@ -284,6 +305,29 @@ class AgentSession:
                 # CAN only at turn boundaries. The stream log + transcript are
                 # carried; the in-memory checkpointer is discarded by design.
                 self._continue_as_new(start)
+
+    async def _stream_janitor(self) -> None:
+        """Bound the in-memory stream log DURING a turn (see constants above).
+
+        Runs as a sidecar task while a turn executes: every
+        STREAM_JANITOR_TICK_SECS (a durable timer), if the log has grown
+        past STREAM_LOG_TRIM_THRESHOLD, truncate the oldest entries so only
+        the newest STREAM_LOG_TRIM_KEEP remain. Truncation is synchronous
+        SDK code (no awaits inside), so cancelling this task can never
+        leave a half-trimmed log.
+        """
+        while True:
+            await workflow.sleep(STREAM_JANITOR_TICK_SECS)
+            state = self._stream.get_state()
+            if len(state.log) <= STREAM_LOG_TRIM_THRESHOLD:
+                continue
+            drop = len(state.log) - STREAM_LOG_TRIM_KEEP
+            self._stream.truncate(state.base_offset + drop)
+            workflow.logger.info(
+                "stream janitor: trimmed %d log entries (kept newest %d)",
+                drop,
+                STREAM_LOG_TRIM_KEEP,
+            )
 
     def _continue_as_new(self, start: SessionStart) -> None:
         """CAN with bounded carried state (the TMPRL1103 wedge guard).
