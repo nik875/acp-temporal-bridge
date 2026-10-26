@@ -291,6 +291,18 @@ class BridgeAgent:
         # stream an in-flight turn to the reattached client until turn_end.
         self._tail_tasks: dict[str, asyncio.Task[None]] = {}
 
+    async def aclose(self) -> None:
+        """Shut down per-connection state; called when the ACP client drops.
+
+        Cancels every live tail task — without this they keep tailing the
+        workflow stream and pushing updates into a dead connection.
+        """
+        for task in self._tail_tasks.values():
+            task.cancel()
+        if self._tail_tasks:
+            await asyncio.gather(*self._tail_tasks.values(), return_exceptions=True)
+        self._tail_tasks.clear()
+
     # -- ACP lifecycle -------------------------------------------------------
 
     async def initialize(
@@ -602,13 +614,27 @@ async def _handle_connection(
     # read loop on the same reader ("readuntil() called while another
     # coroutine is already waiting for incoming data" on the first prompt).
     # Same pattern as the SDK's own stdio runner.
-    conn = AgentSideConnection(
-        lambda client: BridgeAgent(client, temporal), writer, reader,
-        listening=False,
-    )
+    #
+    # The SDK's context managers (spawn_client_process et al.) always pair the
+    # connection with `await conn.close()` in a finally — so must we. Without
+    # it, every connection leaks its supervised sender/dispatcher/handler
+    # tasks (pending forever, one set per client reconnect) until GC destroys
+    # them mid-flight ("Task was destroyed but it is pending" / "cannot reuse
+    # already awaited coroutine"), which can sever a live turn's stream.
+    holder: list[BridgeAgent] = []
+
+    def make_agent(client: Client) -> BridgeAgent:
+        agent = BridgeAgent(client, temporal)
+        holder.append(agent)
+        return agent
+
+    conn = AgentSideConnection(make_agent, writer, reader, listening=False)
     try:
         await conn.listen()
     finally:
+        if holder:
+            await holder[0].aclose()
+        await conn.close()
         writer.close()
         try:
             await writer.wait_closed()
