@@ -158,6 +158,31 @@ def _lc_message_text(dump: dict[str, Any]) -> str:
     return ""
 
 
+def _transcript_message(dump: dict[str, Any]) -> tuple[str, str]:
+    """(role, text) from one durable-transcript message dump.
+
+    The transcript is langchain's ``message_to_dict`` form:
+    ``{"type": "human"|"ai"|"tool"|"system", "data": {"content": ...}}``
+    (see session._serialize). Unknown shapes yield ("", "") and are skipped.
+    """
+    if not isinstance(dump, dict):
+        return "", ""
+    role = str(dump.get("type") or "")
+    data = dump.get("data")
+    content = data.get("content") if isinstance(data, dict) else None
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    else:
+        text = ""
+    return role, text
+
+
 def translate_stream_item(item: Any) -> list[Any]:
     """Map one WorkflowStreamItem (or its raw data) to 0..n ACP updates.
 
@@ -334,16 +359,15 @@ class BridgeAgent:
         except tc.RPCError:
             return  # gone / query timeout: nothing to render
         for dump in (tail or {}).get("transcript", []) or []:
-            text = _lc_message_text(dump)
+            role, text = _transcript_message(dump)
             if not text:
                 continue
-            ids = dump.get("id") or []
-            if "HumanMessage" in ids:
+            if role == "human":
                 update: Any = UserMessageChunk(
                     session_update="user_message_chunk",
                     content=text_block(text),
                 )
-            elif "AIMessage" in ids:
+            elif role == "ai":
                 update = AgentMessageChunk(
                     session_update="agent_message_chunk",
                     content=text_block(text),

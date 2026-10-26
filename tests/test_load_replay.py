@@ -70,13 +70,9 @@ class _FakeConn:
         self.updates.append(update)
 
 
-def _msg(kind: str, text: str) -> dict[str, Any]:
-    return {
-        "lc": 1,
-        "type": "constructor",
-        "id": ["langchain", "schema", "messages", kind],
-        "kwargs": {"content": text},
-    }
+def _msg(role: str, text: str) -> dict[str, Any]:
+    """Durable-transcript form: langchain message_to_dict output."""
+    return {"type": role, "data": {"content": text, "type": role}}
 
 
 async def test_load_renders_transcript_history(
@@ -86,10 +82,13 @@ async def test_load_renders_transcript_history(
     conn = _FakeConn()
     handle = _FakeHandle(
         transcript=[
-            _msg("HumanMessage", "hello"),
-            _msg("AIMessage", "hi there"),
-            _msg("ToolMessage", "raw tool output — not renderable"),
-            _msg("SystemMessage", "system — not renderable"),
+            _msg("human", "hello"),
+            _msg("ai", "hi there"),
+            _msg("tool", "raw tool output — not renderable"),
+            _msg("system", "system — not renderable"),
+            # unknown shapes are skipped, never fatal
+            "garbage",
+            {"type": "future_role", "data": {"content": "x"}},
         ]
     )
     agent = BridgeAgent(conn, _FakeTemporal(handle))  # type: ignore[arg-type]
