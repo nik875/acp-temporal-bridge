@@ -184,6 +184,62 @@ async def test_transcript_carries_across_continue_as_new() -> None:
         assert any("first reply" in t for t in texts), texts
 
 
+async def test_mid_turn_can_resumes_turn_from_transcript() -> None:
+    """The guard trips MID-turn (forced): run() continue-as-news and the
+    successor run re-enters the interrupted turn from the carried transcript.
+
+    Contract: the client sees exactly one turn_end (the CAN is invisible —
+    the stream subscription follows the CAN chain), the model response is
+    emitted exactly once, the transcript holds human+ai exactly once each,
+    and a follow-up prompt completes normally (the force hook must not
+    re-trip on the resumed or later turns).
+    """
+    _configure()
+    async with await _workflow_env() as env, Worker(
+        env.client,
+        task_queue="t",
+        workflows=[AgentSession],
+        # Response 1 is consumed only by the RESUMED turn: the guard trips
+        # before the interrupted turn's first model call.
+        plugins=[_plugin(["first reply", "second reply"])],
+    ):
+        handle = await env.client.start_workflow(
+            AgentSession.run,
+            args=[_session_start(force_mid_turn_can=True), None, None],
+            id=session_workflow_id(SESSION_ID),
+            task_queue="t",
+        )
+        await handle.execute_update(AgentSession.prompt, PromptIn(text="hello"))
+        events, updates, end = await asyncio.wait_for(
+            _collect_until_turn_end(env.client, 0), timeout=30
+        )
+        ends = [e for e in events if e.get("kind") == "turn_end"]
+        assert len(ends) == 1 and ends[0]["stop_reason"] == "end_turn", events
+        texts = [u.content.text for u in updates if isinstance(u, AgentMessageChunk)]
+        assert sum("first reply" in t for t in texts) == 1, texts
+
+        info = await handle.query(AgentSession.transcript_tail)
+        contents = [
+            m.get("data", {}).get("content", "")
+            for m in info["transcript"]
+            if isinstance(m.get("data"), dict)
+        ]
+        assert contents.count("hello") == 1, contents
+        assert sum("first reply" in c for c in contents) == 1, contents
+
+        # A second normal prompt runs to completion: force doesn't re-trip.
+        await handle.execute_update(AgentSession.prompt, PromptIn(text="second"))
+        events2, updates2, _ = await asyncio.wait_for(
+            _collect_until_turn_end(env.client, end), timeout=30
+        )
+        assert events2[-1]["kind"] == "turn_end", events2[-1]
+        assert events2[-1]["stop_reason"] == "end_turn", events2[-1]
+        assert any(
+            isinstance(u, AgentMessageChunk) and "second reply" in u.content.text
+            for u in updates2
+        ), updates2
+
+
 async def test_approval_gate_approve_resumes() -> None:
     """Gated tool call pauses the workflow; resolve_approval(approve) resumes it."""
     _configure(interrupt_tool="echo")
