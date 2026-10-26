@@ -149,3 +149,65 @@ async def test_missing_stop_reason_defaults_end_turn(
     agent, _conn = _agent()
     resp = await agent.prompt("s1", [])
     assert resp.stop_reason == "end_turn"
+
+
+class _CancelRecordingHandle:
+    def __init__(self, workflow_id: str, log: list[str]) -> None:
+        self._workflow_id = workflow_id
+        self._log = log
+
+    async def execute_update(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def cancel(self) -> None:
+        self._log.append(self._workflow_id)
+
+
+class _CancelRecordingTemporal:
+    def __init__(self) -> None:
+        self.started: list[str] = []
+        self.cancels: list[str] = []
+
+    def get_workflow_handle(self, workflow_id: str) -> _CancelRecordingHandle:
+        return _CancelRecordingHandle(workflow_id, self.cancels)
+
+    async def start_workflow(self, *args: Any, **kwargs: Any) -> None:
+        self.started.append(kwargs.get("id", "?"))
+
+
+def _cancelling_agent() -> tuple[BridgeAgent, _FakeConn, _CancelRecordingTemporal]:
+    from acp_temporal_bridge import SessionSpec, configure
+
+    configure(
+        default_spec=SessionSpec(model="mock", system_prompt="e2e", tools=["echo"])
+    )
+    conn = _FakeConn()
+    temporal = _CancelRecordingTemporal()
+    return BridgeAgent(conn, temporal), conn, temporal
+
+
+async def test_aclose_cancels_never_prompted_sessions() -> None:
+    """aclose() cancels sessions this connection created but never prompted:
+    clients (paseo probes, reconnecting UIs) spawn sessions they never use —
+    without this the workflow waits on its prompt signal forever."""
+    agent, _conn, temporal = _cancelling_agent()
+    await agent.new_session(cwd="~")
+    await agent.new_session(cwd="~")
+    assert len(temporal.started) == 2
+    await agent.aclose()
+    assert sorted(temporal.cancels) == sorted(temporal.started)
+
+
+async def test_aclose_keeps_prompted_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompted session survives disconnect — the client may reconnect and
+    reattach (the durability promise). Only the empty probes get cancelled."""
+    _use_stream(
+        monkeypatch, [_Item({"kind": "turn_end", "stop_reason": "end_turn"}, 0)]
+    )
+    agent, _conn, temporal = _cancelling_agent()
+    sid = await agent.new_session(cwd="~")
+    await agent.prompt(sid.session_id, [])
+    await agent.aclose()
+    assert temporal.cancels == []
