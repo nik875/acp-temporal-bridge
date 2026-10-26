@@ -287,6 +287,12 @@ class BridgeAgent:
         # ACP notifications carry no response, so prompt() owns the offset
         # bookkeeping for its session; cancel needs the same map read-only.
         self._offsets: dict[str, int] = {}
+        # Sessions this connection created / actually prompted: aclose()
+        # cancels the created-but-never-prompted ones (clients — paseo
+        # probes, reconnecting UIs — spawn sessions they never use, and
+        # without this the workflow waits on its prompt signal forever).
+        self._created: set[str] = set()
+        self._prompted: set[str] = set()
         # Per-session background tail tasks spawned by load_session: they
         # stream an in-flight turn to the reattached client until turn_end.
         self._tail_tasks: dict[str, asyncio.Task[None]] = {}
@@ -295,13 +301,24 @@ class BridgeAgent:
         """Shut down per-connection state; called when the ACP client drops.
 
         Cancels every live tail task — without this they keep tailing the
-        workflow stream and pushing updates into a dead connection.
+        workflow stream and pushing updates into a dead connection. Also
+        cancels sessions this connection created but never prompted: they
+        hold nothing (no transcript, no turn), so cancelling is lossless;
+        prompted sessions survive (the client may reconnect and reattach —
+        that is the durability promise).
         """
         for task in self._tail_tasks.values():
             task.cancel()
         if self._tail_tasks:
             await asyncio.gather(*self._tail_tasks.values(), return_exceptions=True)
         self._tail_tasks.clear()
+        for session_id in self._created - self._prompted:
+            handle = self._temporal.get_workflow_handle(
+                session_workflow_id(session_id)
+            )
+            # Already gone (completed/expired/cancelled) is fine.
+            with contextlib.suppress(tc.RPCError):
+                await handle.cancel()
 
     # -- ACP lifecycle -------------------------------------------------------
 
@@ -340,6 +357,7 @@ class BridgeAgent:
             task_queue=TASK_QUEUE,
         )
         self._offsets[session_id] = 0
+        self._created.add(session_id)
         return NewSessionResponse(session_id=session_id)
 
     async def load_session(
@@ -475,6 +493,7 @@ class BridgeAgent:
             if getattr(block, "type", None) == "text" and getattr(block, "text", "")
         )
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
+        self._prompted.add(session_id)
         await handle.execute_update(AgentSession.prompt, PromptIn(text=text))
         # A load_session tail may still be streaming an in-flight turn to
         # this client; drain it (through turn_end) before subscribing, or

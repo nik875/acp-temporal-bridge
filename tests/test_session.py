@@ -414,3 +414,53 @@ async def test_turn_two_sees_turn_one_memory() -> None:
     assert len(provider_calls) >= 2, provider_calls
     turn2 = provider_calls[-1]
     assert "XYZZY-marker" in turn2, f"turn 2 forgot turn 1: {turn2[:500]!r}"
+
+
+async def test_never_prompted_session_expires_idle() -> None:
+    """A session created but never prompted (the paseo-probe leak: clients
+    spawn sessions they never use) completes cleanly once its short idle
+    budget expires — it holds nothing worth keeping."""
+    _configure()
+    async with await _workflow_env() as env, Worker(
+        env.client,
+        task_queue="t",
+        workflows=[AgentSession],
+        plugins=[_plugin(["ack"])],
+    ):
+        handle = await env.client.start_workflow(
+            AgentSession.run,
+            args=[_session_start(force_idle_expiry_secs=1), None, None],
+            id=session_workflow_id(SESSION_ID),
+            task_queue="t",
+        )
+        await handle.result()  # completes (not stuck waiting forever)
+        info = await handle.describe()
+        assert info.status.name == "COMPLETED"
+
+
+async def test_prompted_session_expires_after_idle_budget() -> None:
+    """Expiry applies between turns: after a real turn, the next idle wait
+    still carries the budget and the session closes cleanly. Every prompt
+    resets the timer (the wait is re-entered per turn), and mid-turn waits
+    (approval gates) are untouched."""
+    _configure()
+    async with await _workflow_env() as env, Worker(
+        env.client,
+        task_queue="t",
+        workflows=[AgentSession],
+        plugins=[_plugin([AIMessage(content="hi there")])],
+    ):
+        handle = await env.client.start_workflow(
+            AgentSession.run,
+            args=[_session_start(force_idle_expiry_secs=1), None, None],
+            id=session_workflow_id(SESSION_ID),
+            task_queue="t",
+        )
+        events, _updates, _offset = await _prompt_and_wait(
+            env.client, handle, "say hi", 0
+        )
+        assert events[-1]["kind"] == "turn_end"
+        # The idle wait after the turn expires into a clean completion.
+        await handle.result()
+        info = await handle.describe()
+        assert info.status.name == "COMPLETED"

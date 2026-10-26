@@ -105,6 +105,24 @@ STREAM_LOG_TRIM_KEEP = int(os.environ.get("ACP_BRIDGE_STREAM_LOG_TRIM_KEEP", "10
 STREAM_JANITOR_TICK_SECS = float(
     os.environ.get("ACP_BRIDGE_STREAM_JANITOR_TICK_SECS", "20")
 )
+# Idle-session expiry. The bridge starts one workflow per ACP session/new and
+# nothing else completes a never-prompted one (observed 2026-10-26: 104
+# RUNNING sessions in 33 h, 66 of them zero-content — paseo probes and
+# reconnecting clients create sessions they never prompt, and aclose() only
+# cleans stream tails). The between-turns wait for the next prompt carries a
+# budget: a never-prompted session (empty transcript — nothing to lose)
+# expires quickly; a prompted one gets a generous window, reset by every
+# turn. Mid-turn waits (approval gates) are NOT affected — expiry only
+# applies while idle. Gated by workflow.patched("bridge.idle-expiry"): a
+# None->positive timer switch is a nondeterminism hazard for histories
+# recorded before this change (temporalio wait_condition docstring), so old
+# runs keep the unbounded wait until their next CAN starts a fresh history.
+IDLE_EXPIRY_NEVER_PROMPTED_SECS = int(
+    os.environ.get("ACP_BRIDGE_IDLE_EXPIRY_NEW_SECS", "3600")
+)
+IDLE_EXPIRY_PROMPTED_SECS = int(
+    os.environ.get("ACP_BRIDGE_IDLE_EXPIRY_SECS", str(7 * 24 * 3600))
+)
 # Workflow ids are prefixed so external components can distinguish session
 # workflows from others on the queue.
 WORKFLOW_PREFIX = os.environ.get("ACP_BRIDGE_WORKFLOW_PREFIX", "agent-")
@@ -135,6 +153,9 @@ class SessionStart:
     # the first turn (simulating a history-budget breach without waiting for
     # real history growth). The resumed turn does not re-trip it.
     force_mid_turn_can: bool = False
+    # Test/driver hook: override the idle-expiry budget (seconds) regardless
+    # of prompted state. 0 = use the module defaults (see IDLE_EXPIRY_*).
+    force_idle_expiry_secs: int = 0
     # Set internally by the mid-turn CAN path: the successor run must re-enter
     # the interrupted turn from the carried transcript instead of waiting for
     # a new prompt. Never set by clients.
@@ -356,7 +377,34 @@ class AgentSession:
                     self._turn(run, None, start.force_mid_turn_can)
                 )
             else:
-                await workflow.wait_condition(lambda: bool(self._queue))
+                budget = start.force_idle_expiry_secs or (
+                    IDLE_EXPIRY_NEVER_PROMPTED_SECS
+                    if not self._transcript
+                    else IDLE_EXPIRY_PROMPTED_SECS
+                )
+                if workflow.patched("bridge.idle-expiry"):
+                    try:
+                        await workflow.wait_condition(
+                            lambda: bool(self._queue),
+                            timeout=timedelta(seconds=budget),
+                        )
+                    except TimeoutError:
+                        # A prompt signal can land between the timer firing
+                        # and this handler: serve it instead of expiring.
+                        if self._queue:
+                            pass
+                        else:
+                            # Nothing mid-turn, nothing unsaved: the
+                            # transcript is the durable record, and an idle
+                            # session holds no in-memory state worth keeping.
+                            workflow.logger.info(
+                                "session expired idle (prompted=%s, budget=%ss)",
+                                bool(self._transcript),
+                                budget,
+                            )
+                            return
+                else:
+                    await workflow.wait_condition(lambda: bool(self._queue))
                 prompt = self._queue.pop(0)
                 task = asyncio.create_task(
                     self._turn(run, prompt.text, start.force_mid_turn_can)
