@@ -80,3 +80,55 @@ async def test_initialize_over_real_socket(caplog):
     writer.close()
     srv.close()
     await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_connection_teardown_closes_supervised_tasks():
+    """Regression (v0.1.9 deployed code): _handle_connection leaked the SDK's
+    supervised tasks on every client disconnect.
+
+    The connection's sender/dispatcher/handler loops stayed pending forever
+    (nothing called Connection.close()), one set per client reconnect. They
+    piled up until GC destroyed them mid-flight — "Task was destroyed but it
+    is pending!" + "cannot reuse already awaited coroutine" from the task
+    supervisor — which is how a live turn's stream got severed
+    (ERR_STREAM_PREMATURE_CLOSE on the client) and its turn wedged as
+    "A foreground turn is already active" in Paseo.
+    """
+    temporal = MagicMock()
+
+    async def server(client_reader, client_writer):
+        await _handle_connection(temporal, client_reader, client_writer)
+
+    srv = await asyncio.start_server(server, "127.0.0.1", 0)
+    port = srv.sockets[0].getsockname()[1]
+
+    def acp_tasks() -> list[asyncio.Task]:
+        return [t for t in asyncio.all_tasks() if t.get_name().startswith("acp.")]
+
+    try:
+        for _ in range(3):  # churn: connect, initialize, disconnect
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            client = ClientSideConnection(TinyClient(), writer, reader)
+            await asyncio.wait_for(
+                client.initialize(
+                    protocol_version=1,
+                    client_info=Implementation(name="regression", version="0"),
+                    client_capabilities=ClientCapabilities(),
+                ),
+                timeout=10,
+            )
+            await client._conn.close()  # client side tears down cleanly
+            writer.close()
+            await writer.wait_closed()
+            # give _handle_connection's finally block a beat to finish
+            await asyncio.sleep(0.2)
+
+        leaked = acp_tasks()
+        assert not leaked, (
+            "connection teardown leaked supervised acp.* tasks: "
+            f"{[t.get_name() for t in leaked]}"
+        )
+    finally:
+        srv.close()
+        await srv.wait_closed()
