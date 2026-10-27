@@ -62,6 +62,7 @@ from acp.schema import (
     ToolCallUpdate,
     UserMessageChunk,
 )
+from temporalio.common import WorkflowIDReusePolicy
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 
 from ._config import configure as _configure
@@ -117,6 +118,43 @@ REPLAY_MAX_ITEMS = 50000
 CANCEL_KILL_AFTER_SECS = float(
     os.environ.get("ACP_BRIDGE_CANCEL_KILL_AFTER_SECS", "5")
 )
+
+
+def _consume_update_exception(task: asyncio.Task[None]) -> None:
+    """Done-callback for fire-and-forget update tasks.
+
+    Retrieves the exception (suppressing it) so asyncio never logs
+    "exception was never retrieved" — the watchdog, not the update
+    task, owns the escalation on a dead workflow.
+    """
+    with contextlib.suppress(Exception):
+        task.result()
+
+
+def _is_closed_workflow(exc: BaseException) -> bool:
+    """True when an RPC failed because the target workflow is already closed.
+
+    Temporal surfaces this as an RPC error whose message (possibly on a
+    cause) is "workflow execution already completed". A session workflow
+    closes three ways in production: the cancel watchdog TERMINATED it,
+    a client-cancel raced the turn, or it expired idle. The bridge must
+    treat the closed workflow as recoverable (recreate, v0.1.16), not a
+    fatal protocol error — before this, every prompt to a killed session
+    bounced off it forever with ACP internal_error -32603, bricking the
+    session in Paseo until the pod restarted.
+    """
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if "workflow execution already completed" in str(cur).lower():
+            return True
+        stack.append(cur.__cause__)
+        stack.append(cur.__context__)
+    return False
 # History render bound: a load_session replays at most this many transcript
 # messages (oldest are dropped — the newest turns matter most on reattach).
 REPLAY_TRANSCRIPT_MESSAGES = 200
@@ -392,6 +430,36 @@ class BridgeAgent:
         self._created.add(session_id)
         return NewSessionResponse(session_id=session_id)
 
+    async def _recreate_closed_session(self, session_id: str) -> tc.WorkflowHandle:
+        """Start a fresh AgentSession under the SAME workflow id.
+
+        For sessions whose workflow closed out from under the client
+        (watchdog terminate on interrupt, idle expiry). The ACP session
+        id is client-visible state — Paseo keeps using it — so the
+        replacement must land on the same id, not a new one. ALLOW_DUPLICATE
+        (not FAILED_ONLY) because idle expiry COMPLETES the workflow
+        cleanly and must still be recreatable; the only window where a
+        live workflow could be duplicated is a lost-update race that the
+        "already completed" error already rules out.
+
+        Resets replay bookkeeping for the new run: offsets go to 0 (the
+        new workflow's stream starts fresh) and any load_session tail
+        task is cancelled (it was subscribed to the dead workflow).
+        """
+        start = SessionStart(run=get_default_spec(), session_id=session_id)
+        await self._temporal.start_workflow(
+            AgentSession.run,
+            args=[start, None, None],  # stream_state/transcript: fresh run
+            id=session_workflow_id(session_id),
+            task_queue=TASK_QUEUE,
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+        )
+        self._offsets[session_id] = 0
+        tail = self._tail_tasks.pop(session_id, None)
+        if tail is not None and not tail.done():
+            tail.cancel()
+        return self._temporal.get_workflow_handle(session_workflow_id(session_id))
+
     async def load_session(
         self,
         cwd: str,
@@ -401,7 +469,18 @@ class BridgeAgent:
         **kwargs: Any,
     ) -> LoadSessionResponse:
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
-        await handle.describe()  # raises if gone
+        try:
+            await handle.describe()
+        except tc.RPCError:
+            # Session workflow is gone (watchdog terminate, client-cancel
+            # race, idle expiry). A reattaching client must still get a
+            # usable session: return with an EMPTY replay — the client
+            # renders a fresh session, and the next prompt() recreates the
+            # workflow under the same id (see _recreate_closed_session).
+            # Before v0.1.16 this raised, and Paseo showed the bricked
+            # session as permanently unloadable.
+            self._offsets[session_id] = 0
+            return LoadSessionResponse(session_id=session_id)
         # A reattaching client (crash, pod roll, client restart) must see the
         # conversation NOW, not on its next prompt: until session/updates
         # arrive, the client renders an empty "start chatting with this
@@ -526,7 +605,17 @@ class BridgeAgent:
         )
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
         self._prompted.add(session_id)
-        await handle.execute_update(AgentSession.prompt, PromptIn(text=text))
+        try:
+            await handle.execute_update(AgentSession.prompt, PromptIn(text=text))
+        except tc.RPCError as e:
+            if not _is_closed_workflow(e):
+                raise
+            # The session workflow is closed (watchdog terminate on a
+            # wedged interrupt, idle expiry, cancel race). Recreate it
+            # under the same id and re-send the prompt — the client only
+            # ever sees a working session, never the -32603 brick.
+            handle = await self._recreate_closed_session(session_id)
+            await handle.execute_update(AgentSession.prompt, PromptIn(text=text))
         # A load_session tail may still be streaming an in-flight turn to
         # this client; drain it (through turn_end) before subscribing, or
         # both loops would send the same items twice.
@@ -656,8 +745,13 @@ class BridgeAgent:
         """
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
         # Fire-and-forget semantics: prompt() sees turn_end(stop_reason=
-        # "cancelled") on the stream and returns.
-        asyncio.create_task(handle.execute_update(AgentSession.cancel))
+        # "cancelled") on the stream and returns. The task's exception (if
+        # any) is consumed by the done-callback: a closed workflow (the
+        # watchdog already terminated it, or idle expiry won the race)
+        # must not spray "exception was never retrieved" warnings — the
+        # watchdog below already fail-closes the escalation.
+        update_task = asyncio.create_task(handle.execute_update(AgentSession.cancel))
+        update_task.add_done_callback(_consume_update_exception)
         watchdog = asyncio.create_task(self._cancel_watchdog(handle))
         self._cancel_watchdogs.add(watchdog)
         watchdog.add_done_callback(self._cancel_watchdogs.discard)
