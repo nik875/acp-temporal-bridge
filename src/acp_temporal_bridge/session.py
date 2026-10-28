@@ -85,6 +85,14 @@ MODEL_MAX_ATTEMPTS = int(os.environ.get("ACP_BRIDGE_MODEL_MAX_ATTEMPTS", "3"))
 # so a server with a raised limit can carry more.
 CAN_ARGS_BUDGET_BYTES = int(os.environ.get("ACP_BRIDGE_CAN_BUDGET_BYTES", "1200000"))
 CAN_MIN_TAIL_ENTRIES = 50  # never carry fewer stream entries than this
+# Mid-turn CAN byte budget (see _check_budget): once history passes this, the
+# NEXT model-call boundary CANs so cold-cache task replays stay well inside
+# the task timeout. Set above the turn-boundary CAN budget (a turn typically
+# adds a few hundred KB of model-activity inputs past the last boundary) and
+# far below the observed 2MB wedge threshold.
+HISTORY_CAN_BUDGET_BYTES = int(
+    os.environ.get("ACP_BRIDGE_HISTORY_CAN_BUDGET_BYTES", "1400000")
+)
 TOOL_OUTPUT_TRANSCRIPT_CAP = 8000  # transcript tool outputs at CAN time
 MAX_GATES_PER_RUN = 10
 # Mid-turn stream-log janitor: _stream_state_with_tail bounds what CAN
@@ -251,7 +259,20 @@ class _CanGuardModel(TemporalModel):
             await self.ui_gate()
 
     def _check_budget(self) -> None:
+        # Two triggers, both deterministic under replay:
+        #  - is_continue_as_new_suggested(): the server's own suggestion (fires
+        #    near the history limit — too late on its own).
+        #  - an explicit byte budget (below): long-lived sessions accumulate
+        #    multi-MB histories LONG before the server suggestion fires, and a
+        #    cold-cache worker then must replay the whole history in one task.
+        #    At 2MB that replay takes 25-28s, blowing the task timeout
+        #    (TMPRL1104 loop) — updates/queries/signals (steer cancel included)
+        #    stop being processed and the session wedges (2026-10-28).
+        #    CAN-ing at a model-call boundary once history passes this budget
+        #    keeps cold-cache replays fast, so interrupts stay responsive.
         if self.force or workflow.info().is_continue_as_new_suggested():
+            raise MidTurnContinueAsNew()
+        if workflow.info().get_current_history_size() > HISTORY_CAN_BUDGET_BYTES:
             raise MidTurnContinueAsNew()
 
 
