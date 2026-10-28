@@ -140,6 +140,13 @@ CANCEL_RETRY_MAX_SECS = float(
 UI_HEARTBEAT_INTERVAL_SECS = float(
     os.environ.get("ACP_BRIDGE_UI_HEARTBEAT_INTERVAL_SECS", "10")
 )
+# Workflow TASK timeout (set at workflow start; per-activation, not per-run).
+# The 10s default fails a cold-cache session whose multi-MB history replays
+# in 25-28s — see the session_workflow start path comment for the wedge chain.
+# Env-overridable.
+SESSION_TASK_TIMEOUT_SECS = float(
+    os.environ.get("ACP_BRIDGE_SESSION_TASK_TIMEOUT_SECS", "120")
+)
 
 
 def _consume_update_exception(task: asyncio.Task[None]) -> None:
@@ -472,6 +479,20 @@ class BridgeAgent:
             args=[start, None, None],  # stream_state/transcript: fresh run
             id=session_workflow_id(session_id),
             task_queue=TASK_QUEUE,
+            # Long-lived sessions (dozens of turns) reach multi-MB histories; a
+            # worker-cache miss then forces a FULL history replay in one
+            # workflow task. At 2MB+ that replay takes 25-28s and blows the 10s
+            # default task timeout — the task times out, re-replays, times out
+            # again (TMPRL1104 loop), and NO update/query/signal (including a
+            # mid-turn steer's cancel) is processed until the workflow is
+            # cached again: the turn wedges, Paseo's interrupt-and-replace
+            # fallback races the eventual completion, and every later prompt
+            # dies with "A foreground turn is already active" (observed
+            # 2026-10-28, session sysadmin-76dd64a395ac: the cancel was
+            # accepted ~18s after send). 2 min covers a 10MB replay with
+            # headroom; the history-budget CAN in session.py keeps replays
+            # small in the first place.
+            task_timeout=timedelta(seconds=SESSION_TASK_TIMEOUT_SECS),
         )
         self._offsets[session_id] = 0
         self._created.add(session_id)
@@ -503,6 +524,7 @@ class BridgeAgent:
             id=session_workflow_id(session_id),
             task_queue=TASK_QUEUE,
             id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+            task_timeout=timedelta(seconds=SESSION_TASK_TIMEOUT_SECS),
         )
         self._offsets[session_id] = 0
         tail = self._tail_tasks.pop(session_id, None)

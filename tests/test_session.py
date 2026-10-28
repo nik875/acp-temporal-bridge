@@ -23,6 +23,7 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.deepagents import DeepAgentsPlugin
     from temporalio.deepagents.testing import MockTool, mock_model_provider
 
+import acp_temporal_bridge.session as session_mod
 from acp_temporal_bridge import (
     AgentSession,
     PromptIn,
@@ -464,3 +465,61 @@ async def test_prompted_session_expires_after_idle_budget() -> None:
         await handle.result()
         info = await handle.describe()
         assert info.status.name == "COMPLETED"
+
+async def test_history_budget_cans_mid_turn_invisibly() -> None:
+    """The explicit history-byte budget (not just the server suggestion) CANs
+    at a model-call boundary: the client sees one turn_end, the transcript is
+    intact, and the next turn works. Regression for the 2026-10-28 wedge — a
+    2MB history with no CAN trip made cold-cache task replays blow the 10s
+    task timeout, delaying every cancel/query (mid-turn steering wedged)."""
+    _configure()
+    async with await _workflow_env() as env, Worker(
+        env.client,
+        task_queue="t",
+        workflows=[AgentSession],
+        plugins=[_plugin(["padded reply", "second reply"])],
+    ):
+        # Shrink the budget to "anything at all": the FIRST model-call boundary
+        # (after the turn's history grew) must CAN. Simulates a huge history
+        # without generating megabytes of traffic.
+        orig_budget = session_mod.HISTORY_CAN_BUDGET_BYTES
+        session_mod.HISTORY_CAN_BUDGET_BYTES = 0
+        try:
+            handle = await env.client.start_workflow(
+                AgentSession.run,
+                args=[_session_start(), None, None],
+                id=session_workflow_id(SESSION_ID),
+                task_queue="t",
+            )
+            await handle.execute_update(AgentSession.prompt, PromptIn(text="hello"))
+            events, updates, end = await asyncio.wait_for(
+                _collect_until_turn_end(env.client, 0), timeout=30
+            )
+            ends = [e for e in events if e.get("kind") == "turn_end"]
+            assert len(ends) == 1 and ends[0]["stop_reason"] == "end_turn", events
+            texts = [u.content.text for u in updates if isinstance(u, AgentMessageChunk)]
+            assert sum("padded reply" in t for t in texts) == 1, texts
+
+            info = await handle.query(AgentSession.transcript_tail)
+            contents = [
+                m.get("data", {}).get("content", "")
+                for m in info["transcript"]
+                if isinstance(m.get("data"), dict)
+            ]
+            assert contents.count("hello") == 1, contents
+            assert sum("padded reply" in c for c in contents) == 1, contents
+
+            # Next turn: normal completion (budget 0 keeps CAN-ing at each
+            # boundary, which is the turn-boundary CAN — still invisible).
+            await handle.execute_update(AgentSession.prompt, PromptIn(text="second"))
+            events2, updates2, _ = await asyncio.wait_for(
+                _collect_until_turn_end(env.client, end), timeout=30
+            )
+            assert events2[-1]["kind"] == "turn_end", events2[-1]
+            assert events2[-1]["stop_reason"] == "end_turn", events2[-1]
+            assert any(
+                isinstance(u, AgentMessageChunk) and "second reply" in u.content.text
+                for u in updates2
+            ), updates2
+        finally:
+            session_mod.HISTORY_CAN_BUDGET_BYTES = orig_budget
