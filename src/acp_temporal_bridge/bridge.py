@@ -33,7 +33,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
+import time
 import uuid
 from datetime import timedelta
 from typing import Any, get_args
@@ -99,24 +101,35 @@ TASK_QUEUE = os.environ.get("ACP_BRIDGE_TASK_QUEUE", "durable-agents")
 # (stream items per turn staying well under this bound), delete it
 # entirely; it exists to bound blast radius, not to be load-bearing.
 REPLAY_MAX_ITEMS = 50000
-# Interrupt full-stop watchdog: session/cancel normally kills the turn
-# cooperatively (AgentSession.cancel update -> turn task cancelled ->
-# turn_end stop_reason="cancelled") and the durable session survives.
-# But the update only takes effect if the workflow machinery actually
-# processes it. When it doesn't (wedged worker, lost update), the turn
-# runs forever, the prompt RPC never returns, and Paseo wedges the
-# session as "A foreground turn is already active" — its own force-cancel
-# (ack timeout ~2s) only repairs the DAEMON's view, never the agent.
-# After this grace window the bridge checks the workflow's turn_active
-# query; still alive — or the query itself unanswerable, which is what a
-# wedged worker looks like — the workflow is TERMINATED server-side.
-# Terminate (unlike workflow cancel) needs no live worker, and failing
-# the in-flight prompt() fast is exactly the terminal event the daemon's
-# agent-manager needs to un-wedge. Cost: the killed session's transcript
-# is lost — that is the "interrupt kills the agent, full stop" contract,
-# and it only fires when the cooperative path already failed.
-CANCEL_KILL_AFTER_SECS = float(
-    os.environ.get("ACP_BRIDGE_CANCEL_KILL_AFTER_SECS", "5")
+# Interrupt cancel re-driver: session/cancel kills the turn cooperatively
+# (AgentSession.cancel update -> turn task cancelled -> turn_end
+# stop_reason="cancelled") and the durable session ALWAYS survives —
+# terminating the workflow is forbidden (the 2026-10-28 incident: a v0.1.15
+# watchdog escalated an interrupt to a server-side terminate during a
+# worker Recreate rollout, destroying a 1211-event transcript). But an
+# update only takes effect if a worker is alive to process it, and the
+# deployments are Recreate — a rollout gap has NO worker. So: if the turn
+# is still active CANCEL_RETRY_AFTER_SECS after the first update went out,
+# RE-SEND the cancel update with backoff until it lands. Durable? The
+# re-driver task lives in the bridge process — if the BRIDGE dies, paseo's
+# client-cancel notification dies with the connection, and any reconnect
+# re-drives the cancel (load_session shows the still-running turn). The
+# invariant "interrupt kills only the turn" holds because the update, once
+# delivered, is consumed by the workflow itself.
+CANCEL_RETRY_AFTER_SECS = float(
+    os.environ.get("ACP_BRIDGE_CANCEL_RETRY_AFTER_SECS", "5")
+)
+CANCEL_RETRY_BACKOFF_SECS = float(
+    os.environ.get("ACP_BRIDGE_CANCEL_RETRY_BACKOFF_SECS", "5")
+)
+CANCEL_RETRY_MAX_SECS = float(
+    os.environ.get("ACP_BRIDGE_CANCEL_RETRY_MAX_SECS", "300")
+)
+# UI-liveness heartbeat pacing (the workflow-side gate lives in session.py):
+# the bridge heartbeats every attached session this often. Kept well under
+# UI_STALE_SECS so a single lost beat never trips the gate.
+UI_HEARTBEAT_INTERVAL_SECS = float(
+    os.environ.get("ACP_BRIDGE_UI_HEARTBEAT_INTERVAL_SECS", "10")
 )
 
 
@@ -124,8 +137,8 @@ def _consume_update_exception(task: asyncio.Task[None]) -> None:
     """Done-callback for fire-and-forget update tasks.
 
     Retrieves the exception (suppressing it) so asyncio never logs
-    "exception was never retrieved" — the watchdog, not the update
-    task, owns the escalation on a dead workflow.
+    "exception was never retrieved" — the cancel re-driver, not the
+    update task, owns cancel retry/observability on a dead workflow.
     """
     with contextlib.suppress(Exception):
         task.result()
@@ -136,10 +149,10 @@ def _is_closed_workflow(exc: BaseException) -> bool:
 
     Temporal surfaces this as an RPC error whose message (possibly on a
     cause) is "workflow execution already completed". A session workflow
-    closes three ways in production: the cancel watchdog TERMINATED it,
-    a client-cancel raced the turn, or it expired idle. The bridge must
+    closes three ways in production: a client-cancel raced the turn,
+    idle expiry completed it, or a recreate replaced it. The bridge must
     treat the closed workflow as recoverable (recreate, v0.1.16), not a
-    fatal protocol error — before this, every prompt to a killed session
+    fatal protocol error — before this, every prompt to a closed session
     bounced off it forever with ACP internal_error -32603, bricking the
     session in Paseo until the pod restarted.
     """
@@ -162,6 +175,8 @@ REPLAY_TRANSCRIPT_MESSAGES = 200
 # turn_end (e.g. "error") is surfaced as a prompt failure, never silently
 # mapped onto a fake success.
 ACP_STOP_REASONS = frozenset(get_args(StopReason))
+
+log = logging.getLogger(__name__)
 
 
 class ReplayOverflowError(RuntimeError):
@@ -354,9 +369,17 @@ class BridgeAgent:
         # Per-session background tail tasks spawned by load_session: they
         # stream an in-flight turn to the reattached client until turn_end.
         self._tail_tasks: dict[str, asyncio.Task[None]] = {}
-        # Cancel watchdogs (cancel()): escalate to a server-side terminate
-        # when the cooperative cancel didn't kill the turn in time.
+        # Cancel re-drivers (cancel()): re-send the cancel update until the
+        # turn reports stopped — no terminate path exists; the session
+        # always survives an interrupt.
         self._cancel_watchdogs: set[asyncio.Task[None]] = set()
+        # UI-liveness heartbeats (session.py's ui-gate): one task per
+        # attached session, sending ui_heartbeat(epoch) on a cadence so the
+        # workflow knows a live client is streaming-relevant. _ui_epochs is
+        # the per-session epoch (time_ns: monotonic across bridge restarts,
+        # so a RECONNECTED bridge's beats outrank a dead connection's).
+        self._ui_tasks: dict[str, asyncio.Task[None]] = {}
+        self._ui_epochs: dict[str, int] = {}
 
     async def aclose(self) -> None:
         """Shut down per-connection state; called when the ACP client drops.
@@ -373,15 +396,30 @@ class BridgeAgent:
         if self._tail_tasks:
             await asyncio.gather(*self._tail_tasks.values(), return_exceptions=True)
         self._tail_tasks.clear()
-        # Watchdogs die with the connection: on disconnect the durability
-        # contract wins (the client may reconnect and reattach to the
-        # session — a late terminate would murder a legitimately resumed
-        # session mid-turn).
+        # Cancel re-drivers die with the connection: on disconnect the
+        # durability contract wins (the client may reconnect and reattach
+        # to the session — which still exists, terminate being gone).
         for task in self._cancel_watchdogs:
             task.cancel()
         if self._cancel_watchdogs:
             await asyncio.gather(*self._cancel_watchdogs, return_exceptions=True)
         self._cancel_watchdogs.clear()
+        # UI heartbeats die with the connection, and the workflow is told:
+        # ui_detached pauses any in-flight turn durably (its next model call
+        # gates) until a reconnecting client's heartbeat re-arms the gate.
+        # Tasks are stopped FIRST — a stray heartbeat landing after the
+        # detach signal would silently un-detach the session.
+        for task in self._ui_tasks.values():
+            task.cancel()
+        if self._ui_tasks:
+            await asyncio.gather(*self._ui_tasks.values(), return_exceptions=True)
+        self._ui_tasks.clear()
+        for session_id, epoch in self._ui_epochs.items():
+            with contextlib.suppress(tc.RPCError):
+                await self._temporal.get_workflow_handle(
+                    session_workflow_id(session_id)
+                ).signal(AgentSession.ui_detached, epoch)
+        self._ui_epochs.clear()
         for session_id in self._created - self._prompted:
             handle = self._temporal.get_workflow_handle(
                 session_workflow_id(session_id)
@@ -428,13 +466,16 @@ class BridgeAgent:
         )
         self._offsets[session_id] = 0
         self._created.add(session_id)
+        # Arm the UI gate from the first moment of the session's life: the
+        # first heartbeat lands before any prompt can possibly run.
+        self._ensure_ui_heartbeat(session_id)
         return NewSessionResponse(session_id=session_id)
 
     async def _recreate_closed_session(self, session_id: str) -> tc.WorkflowHandle:
         """Start a fresh AgentSession under the SAME workflow id.
 
         For sessions whose workflow closed out from under the client
-        (watchdog terminate on interrupt, idle expiry). The ACP session
+        (idle expiry, a lost cancel race). The ACP session
         id is client-visible state — Paseo keeps using it — so the
         replacement must land on the same id, not a new one. ALLOW_DUPLICATE
         (not FAILED_ONLY) because idle expiry COMPLETES the workflow
@@ -458,6 +499,9 @@ class BridgeAgent:
         tail = self._tail_tasks.pop(session_id, None)
         if tail is not None and not tail.done():
             tail.cancel()
+        # The fresh run has no UI state; arm the gate immediately so the
+        # prompt that triggered the recreate is covered.
+        self._ensure_ui_heartbeat(session_id)
         return self._temporal.get_workflow_handle(session_workflow_id(session_id))
 
     async def load_session(
@@ -472,9 +516,9 @@ class BridgeAgent:
         try:
             await handle.describe()
         except tc.RPCError:
-            # Session workflow is gone (watchdog terminate, client-cancel
-            # race, idle expiry). A reattaching client must still get a
-            # usable session: return with an EMPTY replay — the client
+            # Session workflow is gone (idle expiry, a cancel race, or a
+            # recreate that lost the race). A reattaching client must still
+            # get a usable session: return with an EMPTY replay — the client
             # renders a fresh session, and the next prompt() recreates the
             # workflow under the same id (see _recreate_closed_session).
             # Before v0.1.16 this raised, and Paseo showed the bricked
@@ -496,6 +540,8 @@ class BridgeAgent:
         head = await self._stream_head(handle)
         self._offsets[session_id] = head
         self._spawn_tail_task(session_id, handle, head)
+        # Reattach = live client: (re)arm the heartbeat with a fresh epoch.
+        self._ensure_ui_heartbeat(session_id)
         return LoadSessionResponse(session_id=session_id)
 
     async def _replay_transcript(
@@ -546,6 +592,43 @@ class BridgeAgent:
         self._tail_tasks[session_id] = asyncio.create_task(
             self._tail_stream(session_id, handle, from_offset)
         )
+
+    def _ensure_ui_heartbeat(self, session_id: str) -> None:
+        """Start (or restart) the UI-liveness heartbeat for a session.
+
+        A fresh epoch per attachment (time_ns: strictly increasing, so a
+        newer connection's beats always outrank a stale one's — and a dead
+        connection's late detach is ignored by the epoch check). Called on
+        every path that (re)attaches a client to a workflow: new_session,
+        load_session (alive workflow), _recreate_closed_session, and
+        prompt() defensively.
+        """
+        existing = self._ui_tasks.get(session_id)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        epoch = time.time_ns()
+        self._ui_epochs[session_id] = epoch
+        self._ui_tasks[session_id] = asyncio.create_task(
+            self._ui_heartbeat_loop(session_id, epoch)
+        )
+
+    async def _ui_heartbeat_loop(self, session_id: str, epoch: int) -> None:
+        """Send ui_heartbeat(epoch) every UI_HEARTBEAT_INTERVAL_SECS.
+
+        The first beat goes out immediately — it is what (re)arms the
+        workflow's gate on attach. RPC errors are suppressed (the workflow
+        may be mid-CAN, the cluster busy); a closed workflow ends the loop
+        (nothing to heartbeat; a future prompt recreates + re-arms).
+        """
+        handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
+        while True:
+            try:
+                await handle.signal(AgentSession.ui_heartbeat, epoch)
+            except tc.RPCError as e:
+                if _is_closed_workflow(e):
+                    return  # workflow gone: nothing left to heartbeat
+                # transient (worker gap, busy cluster): keep beating
+            await asyncio.sleep(UI_HEARTBEAT_INTERVAL_SECS)
 
     async def _tail_stream(
         self, session_id: str, handle: tc.WorkflowHandle, offset: int
@@ -610,12 +693,17 @@ class BridgeAgent:
         except tc.RPCError as e:
             if not _is_closed_workflow(e):
                 raise
-            # The session workflow is closed (watchdog terminate on a
-            # wedged interrupt, idle expiry, cancel race). Recreate it
-            # under the same id and re-send the prompt — the client only
-            # ever sees a working session, never the -32603 brick.
+            # The session workflow is closed (idle expiry, cancel race).
+            # Recreate it under the same id and re-send the prompt — the
+            # client only ever sees a working session, never the -32603
+            # brick.
             handle = await self._recreate_closed_session(session_id)
             await handle.execute_update(AgentSession.prompt, PromptIn(text=text))
+        # Defensive re-arm: if the heartbeat loop died with a previously
+        # closed workflow (recreate above), a fresh one must exist BEFORE
+        # this turn starts — once the gate is armed, a turn must never run
+        # headless just because no beat was flowing.
+        self._ensure_ui_heartbeat(session_id)
         # A load_session tail may still be streaming an in-flight turn to
         # this client; drain it (through turn_end) before subscribing, or
         # both loops would send the same items twice.
@@ -735,51 +823,70 @@ class BridgeAgent:
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         """ACP notification: client asked to cancel the in-flight turn.
 
-        Two-phase. Phase 1 is the cooperative update (unchanged): the
-        workflow cancels its turn task, the run loop records turn_end
-        stop_reason="cancelled", and the durable session survives. Phase
-        2 is a watchdog: if the turn is still alive after
-        CANCEL_KILL_AFTER_SECS — or the turn_active query cannot even be
-        answered, which is what a wedged worker looks like — the workflow
-        is TERMINATED server-side. See CANCEL_KILL_AFTER_SECS for why.
+        Cooperative-only, with a durable re-driver: the cancel update is
+        re-sent with backoff until the turn reports inactive. The session
+        workflow is NEVER terminated — an interrupt kills only the turn;
+        the session and transcript always survive (2026-10-28 decision).
+        A worker gap (Recreate rollout) just delays the retry until a
+        worker returns — exactly the case the old terminate escalation
+        mishandled.
         """
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
         # Fire-and-forget semantics: prompt() sees turn_end(stop_reason=
         # "cancelled") on the stream and returns. The task's exception (if
-        # any) is consumed by the done-callback: a closed workflow (the
-        # watchdog already terminated it, or idle expiry won the race)
-        # must not spray "exception was never retrieved" warnings — the
-        # watchdog below already fail-closes the escalation.
+        # any) is consumed by the done-callback — the re-driver below owns
+        # retrying, and a closed workflow (idle expiry won the race) must
+        # not spray "exception was never retrieved" warnings.
         update_task = asyncio.create_task(handle.execute_update(AgentSession.cancel))
         update_task.add_done_callback(_consume_update_exception)
-        watchdog = asyncio.create_task(self._cancel_watchdog(handle))
-        self._cancel_watchdogs.add(watchdog)
-        watchdog.add_done_callback(self._cancel_watchdogs.discard)
+        redriver = asyncio.create_task(self._cancel_redriver(handle))
+        self._cancel_watchdogs.add(redriver)
+        redriver.add_done_callback(self._cancel_watchdogs.discard)
 
-    async def _cancel_watchdog(self, handle: tc.WorkflowHandle) -> None:
-        """Escalate an unanswered cancel to a server-side terminate."""
-        await asyncio.sleep(CANCEL_KILL_AFTER_SECS)
-        alive: bool | None = None
-        # Fail closed: the query is purely advisory, so ANY failure (wedged
-        # worker, RPC timeout, workflow already gone) counts as "cannot
-        # prove the turn ended" and escalates to the terminate.
-        with contextlib.suppress(Exception):
-            alive = await handle.query(
-                AgentSession.turn_active, rpc_timeout=timedelta(seconds=5)
-            )
-        if alive is False:
-            # Cooperative cancel won: turn ended, session and transcript
-            # survive. (This is the normal path; the watchdog is a no-op.)
-            return
-        # alive is True (worker healthy, turn still running — the update
-        # never took effect) or None (query failed: wedged worker). Either
-        # way the turn is out of cooperative reach; terminate needs no
-        # worker at all and fails the in-flight prompt() immediately.
-        with contextlib.suppress(tc.RPCError):
-            await handle.terminate(
-                reason="cancel watchdog: turn survived cooperative cancel",
-                rpc_timeout=timedelta(seconds=5),
-            )
+    async def _cancel_redriver(self, handle: tc.WorkflowHandle) -> None:
+        """Re-send the cancel update until the turn is confirmed stopped.
+
+        No terminate exists on this path — the session outlives every
+        interrupt. The turn_active query is advisory: any query failure is
+        treated as "unknown" and the retry loop continues (a worker gap
+        makes both the update AND the query fail; both recover when a
+        worker returns). Bounded total wait so a genuinely stuck loop
+        gives up visibly instead of leaking a task forever; the turn
+        itself remains durably cancellable by any later cancel.
+        """
+        delay = CANCEL_RETRY_BACKOFF_SECS
+        deadline = asyncio.get_running_loop().time() + CANCEL_RETRY_MAX_SECS
+        while True:
+            await asyncio.sleep(min(CANCEL_RETRY_AFTER_SECS, delay))
+            alive: bool | None = None
+            try:
+                alive = await handle.query(
+                    AgentSession.turn_active, rpc_timeout=timedelta(seconds=5)
+                )
+            except tc.RPCError as e:
+                if _is_closed_workflow(e):
+                    return  # workflow closed (idle expiry): turn ended with it
+                alive = None  # worker gap / wedged query: unknown, keep retrying
+            except Exception:  # noqa: BLE001 — any query failure is "unknown"
+                alive = None
+            if alive is False:
+                return  # cooperative cancel won: turn ended, session intact
+            # Still active, or unknown (worker gap / wedged query). Re-send
+            # the update: once a worker processes it, the turn dies.
+            update_task = asyncio.create_task(handle.execute_update(AgentSession.cancel))
+            update_task.add_done_callback(_consume_update_exception)
+            if asyncio.get_running_loop().time() >= deadline:
+                # Give up on DRIVING the cancel, never on the session: log
+                # loudly (the turn remains durably alive and re-cancellable
+                # by any later cancel / reconnect).
+                log.warning(
+                    "cancel re-driver gave up after %.0fs (turn_active=%s) — "
+                    "turn remains durably alive; session NOT terminated",
+                    CANCEL_RETRY_MAX_SECS,
+                    alive,
+                )
+                return
+            delay = min(delay * 2, CANCEL_RETRY_MAX_SECS)
 
 
 # ---------------------------------------------------------------------------
