@@ -924,6 +924,21 @@ class AgentSession:
         """
         return self._turn_task is not None and not self._turn_task.done()
 
+    @workflow.query
+    def turn_generation(self) -> int:
+        """Monotonic turn counter — the identity of the current turn.
+
+        Read by the bridge's cancel re-driver to scope its retries to the
+        turn it was asked to cancel: if a NEW turn has started since the
+        cancel went out (user re-prompted immediately), the counter moves
+        and the re-driver must stop — re-sending cancel would kill the
+        user's fresh turn (ghost-cancel, found in live e2e 2026-10-28).
+        Workflows started before this query existed reject it (unknown
+        query) — the bridge treats that as "unknown", same as a query
+        failure: keep retrying until turn_active reports False.
+        """
+        return self._turn_count
+
     @workflow.update
     async def resolve_approval(self, decision: dict[str, str | None]) -> None:
         action = decision.get("action", "")
