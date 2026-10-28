@@ -40,6 +40,9 @@ class _FakeHandle:
     async def execute_update(self, *args: Any, **kwargs: Any) -> None:
         _FakeHandle.updates.append(args[0] if args else None)
 
+    async def signal(self, *args: Any, **kwargs: Any) -> None:
+        _FakeHandle.updates.append(("signal", args[0] if args else None))
+
 
 class _FakeTemporal:
     def get_workflow_handle(self, workflow_id: str) -> _FakeHandle:
@@ -157,6 +160,9 @@ class _CancelRecordingHandle:
         self._log = log
 
     async def execute_update(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def signal(self, *args: Any, **kwargs: Any) -> None:
         pass
 
     async def cancel(self) -> None:

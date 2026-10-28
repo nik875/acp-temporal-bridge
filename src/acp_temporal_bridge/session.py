@@ -123,6 +123,23 @@ IDLE_EXPIRY_NEVER_PROMPTED_SECS = int(
 IDLE_EXPIRY_PROMPTED_SECS = int(
     os.environ.get("ACP_BRIDGE_IDLE_EXPIRY_SECS", str(7 * 24 * 3600))
 )
+# UI-liveness gate — the "an agent may never continue without streaming to
+# the UI" invariant (2026-10-28 decision): the bridge sends
+# ui_heartbeat(epoch) signals while a client is attached, ui_detached(epoch)
+# on disconnect. Every turn start and every model call gates on the UI being
+# LIVE (attached + heartbeat fresher than UI_STALE_SECS): a turn whose UI
+# vanished pauses durably here instead of running invisibly. If no live UI
+# returns within UI_LOST_TURN_BUDGET_SECS the turn fails cleanly
+# (stop_reason="error"); session and transcript always survive.
+# Gated by workflow.patched("bridge.ui-gate") for old histories (same
+# None->positive-timer hazard as idle-expiry above).
+UI_HEARTBEAT_INTERVAL_SECS = float(
+    os.environ.get("ACP_BRIDGE_UI_HEARTBEAT_INTERVAL_SECS", "10")
+)
+UI_STALE_SECS = float(os.environ.get("ACP_BRIDGE_UI_STALE_SECS", "45"))
+UI_LOST_TURN_BUDGET_SECS = float(
+    os.environ.get("ACP_BRIDGE_UI_LOST_TURN_BUDGET_SECS", "3600")
+)
 # Workflow ids are prefixed so external components can distinguish session
 # workflows from others on the queue.
 WORKFLOW_PREFIX = os.environ.get("ACP_BRIDGE_WORKFLOW_PREFIX", "agent-")
@@ -160,6 +177,12 @@ class SessionStart:
     # the interrupted turn from the carried transcript instead of waiting for
     # a new prompt. Never set by clients.
     resume_pending_turn: bool = False
+    # UI-liveness state, carried across CAN so a successor run stays gated
+    # (see UI_* constants). Never set by clients — the bridge sends the
+    # ui_heartbeat/ui_detached signals.
+    ui_epoch: int = 0
+    ui_seen: bool = False
+    ui_detached: bool = False
 
 
 class MidTurnContinueAsNew(Exception):
@@ -190,6 +213,11 @@ class _CanGuardModel(TemporalModel):
 
     # Test/driver hook: trip unconditionally (see SessionStart.force_mid_turn_can).
     force: bool = False
+    # UI-liveness gate (see UI_* constants): an async callable awaited before
+    # every model call — it returns once the attached UI is live (or raises
+    # after the UI_LOST budget, failing the turn cleanly). Wired in _turn()
+    # like `force`; None (old histories, tests) = no gate.
+    ui_gate: Any = None
 
     async def _agenerate(
         self,
@@ -199,6 +227,7 @@ class _CanGuardModel(TemporalModel):
         **kwargs: Any,
     ) -> Any:
         self._check_budget()
+        await self._wait_ui()
         return await super()._agenerate(
             messages, stop=stop, run_manager=run_manager, **kwargs
         )
@@ -211,10 +240,15 @@ class _CanGuardModel(TemporalModel):
         **kwargs: Any,
     ) -> Any:
         self._check_budget()
+        await self._wait_ui()
         async for chunk in super()._astream(
             messages, stop=stop, run_manager=run_manager, **kwargs
         ):
             yield chunk
+
+    async def _wait_ui(self) -> None:
+        if self.ui_gate is not None:
+            await self.ui_gate()
 
     def _check_budget(self) -> None:
         if self.force or workflow.info().is_continue_as_new_suggested():
@@ -355,6 +389,15 @@ class AgentSession:
         self._turn_task: asyncio.Task | None = None
         self._turn_count = 0
         self._gates = 0
+        # UI-liveness state (see UI_* constants). Carried across CAN via
+        # SessionStart.ui_*: a successor run must not silently un-arm the
+        # gate. `_ui_seen=False` (no heartbeat yet — old histories, or a
+        # fresh run before the bridge's first heartbeat lands) keeps the
+        # gate INACTIVE for backward compatibility; once armed it stays armed.
+        self._ui_epoch: int = start.ui_epoch
+        self._ui_seen: bool = start.ui_seen
+        self._ui_detached: bool = start.ui_detached
+        self._ui_last: Any = workflow.now() if start.ui_seen else None
 
     @workflow.run
     async def run(
@@ -373,8 +416,13 @@ class AgentSession:
                 # the carried transcript (no new prompt). The flag is
                 # one-shot — cleared so the resumed turn ends normally.
                 start.resume_pending_turn = False
+                # Same gate as a fresh turn: the resumed turn streams model
+                # output too, so it must not run headless either. The gate
+                # lives INSIDE the task (not here) so a UI_LOST budget trip
+                # is caught by the handlers below — turn_end(stop_reason=
+                # "error"), session survives — instead of failing run().
                 task = asyncio.create_task(
-                    self._turn(run, None, start.force_mid_turn_can)
+                    self._gated_turn(run, None, start.force_mid_turn_can, "turn resume")
                 )
             else:
                 budget = start.force_idle_expiry_secs or (
@@ -406,12 +454,18 @@ class AgentSession:
                 else:
                     await workflow.wait_condition(lambda: bool(self._queue))
                 prompt = self._queue.pop(0)
+                # UI-liveness gate lives INSIDE the task (see above): never
+                # START a turn without a live UI to stream to; a budget trip
+                # fails the turn, never the session.
                 task = asyncio.create_task(
-                    self._turn(run, prompt.text, start.force_mid_turn_can)
+                    self._gated_turn(
+                        run, prompt.text, start.force_mid_turn_can, "turn start"
+                    )
                 )
             self._turn_count += 1
             self._turn_task = task
             janitor = asyncio.create_task(self._stream_janitor())
+            ui_watch = asyncio.create_task(self._ui_watchdog())
             try:
                 await task
                 stop_reason = "end_turn"
@@ -438,7 +492,8 @@ class AgentSession:
             finally:
                 self._turn_task = None
                 janitor.cancel()
-                await asyncio.gather(janitor, return_exceptions=True)
+                ui_watch.cancel()
+                await asyncio.gather(janitor, ui_watch, return_exceptions=True)
             # Unreachable after the mid-turn CAN path (_continue_as_new
             # raises out of run()): the resumed turn publishes its own
             # turn_end when it actually completes.
@@ -474,6 +529,98 @@ class AgentSession:
                 STREAM_LOG_TRIM_KEEP,
             )
 
+    def _ui_live(self) -> bool:
+        """True when an attached client is currently streaming-relevant.
+
+        INACTIVE (True) while no heartbeat was ever seen (`_ui_seen=False`,
+        e.g. histories from before this gate or a fresh run whose bridge
+        heartbeat hasn't landed yet) — backward compatibility. Once armed
+        (`_ui_seen=True`) it is strictly liveness: attached, matching epoch,
+        heartbeat younger than UI_STALE_SECS.
+        """
+        if not self._ui_seen:
+            return True
+        if self._ui_detached:
+            return False
+        return workflow.now() - self._ui_last <= timedelta(seconds=UI_STALE_SECS)
+
+    async def _wait_ui(self, what: str = "model call") -> None:
+        """Durable gate: pause until the UI is live (see UI_* constants).
+
+        Called before every turn start/resume and (via the model hook)
+        before every model call. Raises ApplicationError once the UI_LOST
+        budget is exhausted, failing the turn cleanly — the session and
+        transcript always survive.
+        """
+        if workflow.patched("bridge.ui-gate"):
+            try:
+                await workflow.wait_condition(
+                    self._ui_live,
+                    timeout=timedelta(seconds=UI_LOST_TURN_BUDGET_SECS),
+                )
+            except TimeoutError:
+                raise ApplicationError(
+                    f"UI detached for {UI_LOST_TURN_BUDGET_SECS:.0f}s: "
+                    f"{what} aborted (session preserved)"
+                ) from None
+        elif not self._ui_live():
+            workflow.logger.warning(
+                "ui gate inactive (unpatched history): %s proceeding headless",
+                what,
+            )
+
+    async def _ui_watchdog(self) -> None:
+        """UI-liveness sidecar for the CURRENT turn (mirrors _stream_janitor).
+
+        Pure observer: every UI_HEARTBEAT_INTERVAL_SECS (a durable timer),
+        if a turn is running and the UI is not live, log it. The actual
+        gating lives in _wait_ui (turn start/resume + every model call);
+        this sidecar exists so a stalled headless turn is VISIBLE in the
+        workflow history instead of silently paused. Never mutates turn
+        state (workflow code is single-threaded — cancelling _turn_task
+        from a sidecar would race the turn's own exception path).
+        """
+        while True:
+            await workflow.sleep(UI_HEARTBEAT_INTERVAL_SECS)
+            if self._turn_task is None or self._turn_task.done():
+                continue
+            if self._ui_live():
+                continue
+            workflow.logger.warning(
+                "turn running while UI not live (detached=%s, epoch=%s) — "
+                "next model call will pause",
+                self._ui_detached,
+                self._ui_epoch,
+            )
+
+    @workflow.signal
+    def ui_heartbeat(self, epoch: int) -> None:
+        """Bridge: an ACP client is attached and streaming-relevant.
+
+        Arms the liveness gate on the first heartbeat (before this, the
+        gate stays inactive for backward compatibility) and refreshes the
+        last-seen timestamp. A stale epoch (an OLD connection's heartbeat
+        landing after a newer one took over) is ignored.
+        """
+        if epoch < self._ui_epoch:
+            return
+        if epoch > self._ui_epoch or not self._ui_seen:
+            self._ui_epoch = epoch
+        self._ui_seen = True
+        self._ui_detached = False
+        self._ui_last = workflow.now()
+
+    @workflow.signal
+    def ui_detached(self, epoch: int) -> None:
+        """Bridge: the attached client disconnected.
+
+        Only honors epochs >= the current one: a STALE detach (an old
+        connection's cleanup racing a newer attach) must not detach the
+        newer connection's session.
+        """
+        if epoch >= self._ui_epoch:
+            self._ui_detached = True
+
     def _continue_as_new(self, start: SessionStart) -> None:
         """CAN with bounded carried state (the TMPRL1103 wedge guard).
 
@@ -489,6 +636,12 @@ class AgentSession:
         infinite retry loop.
         """
         transcript = _bound_transcript(self._transcript)
+        # Carry UI-liveness state across CAN: the successor run must stay
+        # armed exactly as this one was (an attached UI stays attached; a
+        # detached one stays gated until its reattach heartbeat lands).
+        start.ui_epoch = self._ui_epoch
+        start.ui_seen = self._ui_seen
+        start.ui_detached = self._ui_detached
         state = self._stream.get_state()
         args = [start, state, transcript]
         total = self._can_size(args)
@@ -523,6 +676,15 @@ class AgentSession:
             for p in workflow.payload_converter().to_payloads(args)
         )
 
+    async def _gated_turn(
+        self, run: SessionSpec, text: str | None, force_mid_turn: bool, gate: str
+    ) -> None:
+        """UI-liveness gate + turn, as one task so a gate failure is caught
+        by run()'s turn-exception handlers (turn_end stop_reason="error",
+        session survives) instead of escaping into run() itself."""
+        await self._wait_ui(gate)
+        await self._turn(run, text, force_mid_turn)
+
     async def _turn(
         self, run: SessionSpec, text: str | None, force_mid_turn: bool = False
     ) -> None:
@@ -538,6 +700,10 @@ class AgentSession:
             # The test/driver force hook trips only on a real prompt turn —
             # a resumed turn must be able to complete without re-tripping.
             force=(text is not None) and force_mid_turn,
+            # UI-liveness gate before EVERY model call (the invariant: no
+            # model call proceeds without a live UI to stream to). None for
+            # unpatched histories keeps old runs replay-safe.
+            ui_gate=self._wait_ui if workflow.patched("bridge.ui-gate") else None,
             activity_options={
                 "start_to_close_timeout": timedelta(seconds=MODEL_START_TO_CLOSE_SECS),
                 "heartbeat_timeout": timedelta(seconds=MODEL_HEARTBEAT_TIMEOUT_SECS),
@@ -751,10 +917,10 @@ class AgentSession:
     def turn_active(self) -> bool:
         """True while a turn task is in flight.
 
-        Read by the bridge's cancel watchdog (bridge.py): a cancel whose
-        turn is STILL reported active after the grace window — or whose
-        query cannot be answered at all, which is what a wedged worker
-        looks like — escalates to a server-side terminate.
+        Read by the bridge's cancel re-driver (bridge.py): the cooperative
+        cancel update is retried until the turn reports inactive. No
+        escalate-to-terminate path exists — an interrupt kills only the
+        turn, never the session.
         """
         return self._turn_task is not None and not self._turn_task.done()
 

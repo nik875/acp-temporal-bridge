@@ -142,7 +142,12 @@ async def test_janitor_trims_mid_turn_and_stream_stays_healthy() -> None:
 
     # Small thresholds so the trim fires during the flood turn. The
     # janitor reads these as module globals at runtime, so patching works
-    # without reimport.
+    # without reimport. RESTORED in the finally below: these are passthrough
+    # module globals — leaking them changes every later test's janitor
+    # pacing (and trips time-skipping-framework timer interleaving bugs).
+    orig_threshold = session_mod.STREAM_LOG_TRIM_THRESHOLD
+    orig_keep = session_mod.STREAM_LOG_TRIM_KEEP
+    orig_tick = session_mod.STREAM_JANITOR_TICK_SECS
     session_mod.STREAM_LOG_TRIM_THRESHOLD = 60
     session_mod.STREAM_LOG_TRIM_KEEP = 30
     session_mod.STREAM_JANITOR_TICK_SECS = 0.5
@@ -195,3 +200,6 @@ async def test_janitor_trims_mid_turn_and_stream_stays_healthy() -> None:
             assert events2 and events2[-1]["kind"] == "turn_end"
     finally:
         session_mod.AgentSession._stream_janitor = orig_janitor
+        session_mod.STREAM_LOG_TRIM_THRESHOLD = orig_threshold
+        session_mod.STREAM_LOG_TRIM_KEEP = orig_keep
+        session_mod.STREAM_JANITOR_TICK_SECS = orig_tick
