@@ -116,6 +116,15 @@ REPLAY_MAX_ITEMS = 50000
 # re-drives the cancel (load_session shows the still-running turn). The
 # invariant "interrupt kills only the turn" holds because the update, once
 # delivered, is consumed by the workflow itself.
+#
+# Retries are SCOPED to the turn being cancelled: cancel() snapshots the
+# session's turn_generation before the first update, and the re-driver
+# re-sends only while the generation still matches. Without the scope a
+# fast user re-prompt after the interrupt looks like "turn still active"
+# and the retry ghost-cancels the NEW turn (found in live e2e 2026-10-28:
+# a prompt 2s after an interrupt returned cancelled). An unknown
+# generation (workflow too old for the query / query failure) degrades to
+# v0.1.17 behavior: retry until turn_active reports False.
 CANCEL_RETRY_AFTER_SECS = float(
     os.environ.get("ACP_BRIDGE_CANCEL_RETRY_AFTER_SECS", "5")
 )
@@ -824,7 +833,9 @@ class BridgeAgent:
         """ACP notification: client asked to cancel the in-flight turn.
 
         Cooperative-only, with a durable re-driver: the cancel update is
-        re-sent with backoff until the turn reports inactive. The session
+        re-sent with backoff until the turn reports inactive — scoped to
+        THIS turn (generation snapshot below), so a fast re-prompt after
+        the interrupt can never be ghost-cancelled by a retry. The session
         workflow is NEVER terminated — an interrupt kills only the turn;
         the session and transcript always survive (2026-10-28 decision).
         A worker gap (Recreate rollout) just delays the retry until a
@@ -832,6 +843,17 @@ class BridgeAgent:
         mishandled.
         """
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
+        # Snapshot the turn identity BEFORE the first update: the re-driver
+        # re-sends only while this turn is still the live one. Best-effort —
+        # a too-old workflow (or a query hiccup) yields None and the
+        # re-driver falls back to the unscoped turn_active semantics.
+        generation: int | None = None
+        try:
+            generation = await handle.query(
+                AgentSession.turn_generation, rpc_timeout=timedelta(seconds=5)
+            )
+        except Exception:  # noqa: BLE001 — unknown generation is a fallback, not an error
+            log.debug("turn_generation query failed for %s (unscoped retry)", session_id)
         # Fire-and-forget semantics: prompt() sees turn_end(stop_reason=
         # "cancelled") on the stream and returns. The task's exception (if
         # any) is consumed by the done-callback — the re-driver below owns
@@ -839,20 +861,26 @@ class BridgeAgent:
         # not spray "exception was never retrieved" warnings.
         update_task = asyncio.create_task(handle.execute_update(AgentSession.cancel))
         update_task.add_done_callback(_consume_update_exception)
-        redriver = asyncio.create_task(self._cancel_redriver(handle))
+        redriver = asyncio.create_task(self._cancel_redriver(handle, generation))
         self._cancel_watchdogs.add(redriver)
         redriver.add_done_callback(self._cancel_watchdogs.discard)
 
-    async def _cancel_redriver(self, handle: tc.WorkflowHandle) -> None:
-        """Re-send the cancel update until the turn is confirmed stopped.
+    async def _cancel_redriver(
+        self, handle: tc.WorkflowHandle, generation: int | None
+    ) -> None:
+        """Re-send the cancel update until the interrupted turn is stopped.
 
         No terminate exists on this path — the session outlives every
-        interrupt. The turn_active query is advisory: any query failure is
-        treated as "unknown" and the retry loop continues (a worker gap
-        makes both the update AND the query fail; both recover when a
-        worker returns). Bounded total wait so a genuinely stuck loop
-        gives up visibly instead of leaking a task forever; the turn
-        itself remains durably cancellable by any later cancel.
+        interrupt. Stop conditions: the turn reports inactive; the
+        workflow closed (idle expiry — turn ended with it); or the turn
+        generation moved on, meaning the interrupted turn ALREADY ended
+        and a newer turn exists — re-sending now would ghost-cancel the
+        user's fresh turn, so stop. Query failures (worker gap, wedged
+        query) are "unknown": keep retrying. A Recreate rollout gap just
+        delays the retry until a worker returns. Bounded total wait so a
+        genuinely stuck loop gives up visibly instead of leaking a task
+        forever; the turn itself remains durably cancellable by any later
+        cancel.
         """
         delay = CANCEL_RETRY_BACKOFF_SECS
         deadline = asyncio.get_running_loop().time() + CANCEL_RETRY_MAX_SECS
@@ -871,8 +899,24 @@ class BridgeAgent:
                 alive = None
             if alive is False:
                 return  # cooperative cancel won: turn ended, session intact
-            # Still active, or unknown (worker gap / wedged query). Re-send
-            # the update: once a worker processes it, the turn dies.
+            if generation is not None:
+                # Scope check: is the live turn still the one we were asked
+                # to cancel? A different generation means the interrupted
+                # turn ended and the user moved on — NEVER re-send.
+                try:
+                    now_gen = await handle.query(
+                        AgentSession.turn_generation, rpc_timeout=timedelta(seconds=5)
+                    )
+                except tc.RPCError as e:
+                    if _is_closed_workflow(e):
+                        return
+                    now_gen = None  # unknown: fall through to the active check
+                except Exception:  # noqa: BLE001
+                    now_gen = None
+                if now_gen is not None and now_gen != generation:
+                    return  # interrupted turn is history; newer turn untouchable
+            # Still active (same generation), or unknown. Re-send the
+            # update: once a worker processes it, the turn dies.
             update_task = asyncio.create_task(handle.execute_update(AgentSession.cancel))
             update_task.add_done_callback(_consume_update_exception)
             if asyncio.get_running_loop().time() >= deadline:
