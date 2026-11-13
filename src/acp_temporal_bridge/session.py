@@ -58,7 +58,13 @@ with workflow.unsafe.imports_passed_through():
     # fresh copies — configure() is called at host import time, before any
     # sandbox import, and a fresh sandbox copy would see None seams.
     from . import policy
-    from ._config import SessionSpec, get_backend_builder, get_tool_builder
+    from ._config import (
+        SessionSpec,
+        get_backend_builder,
+        get_memory_sources,
+        get_tool_builder,
+    )
+    from .compaction_middleware import compaction_middleware
 
 MODEL_START_TO_CLOSE_SECS = 600
 # Heartbeat the model activity so a slow/hung LLM call doesn't look dead.
@@ -715,11 +721,20 @@ class AgentSession:
         # default — virtual files in workflow state. The builder runs in-
         # workflow; a TemporalBackend wrapper's ops dispatch out as activities.
         backend = get_backend_builder()() if get_backend_builder() else None
+        # Shared compaction factory (tests/test_path_parity.py guards that BOTH
+        # paths -- this interactive one and the headless DurableAgent -- route
+        # through it with the registry-sourced trigger).
+        middleware = compaction_middleware(model, backend, run.compact_at_tokens)
+        # Memory files (host seam) are injected into the system prompt every
+        # turn by deepagents' memory middleware; None keeps the default.
+        memory = get_memory_sources()
         agent = create_temporal_deep_agent(
             model=model,
             system_prompt=run.system_prompt,
             tools=get_tool_builder()(list(run.tools)),
             backend=backend,
+            middleware=middleware,
+            memory=memory,
             interrupt_on=policy.build_interrupt_on(list(run.tools)),
             checkpointer=self._checkpointer(),
         )
