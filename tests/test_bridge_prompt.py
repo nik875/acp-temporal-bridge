@@ -233,11 +233,13 @@ async def test_prompt_forwards_image_and_resource_blocks(
 
     class _Res:
         type = "resource"
-        resource = {
-            "uri": "file:///x/note.txt",
-            "mimeType": "text/plain",
-            "text": "hello from note",
-        }
+
+        def __init__(self) -> None:
+            self.resource = {
+                "uri": "file:///x/note.txt",
+                "mimeType": "text/plain",
+                "text": "hello from note",
+            }
 
     class _Link:
         type = "resource_link"
@@ -249,7 +251,7 @@ async def test_prompt_forwards_image_and_resource_blocks(
         type = "text"
         text = "what is in these?"
 
-    response = await agent.prompt("s1", [_Img, _Res, _Link, _Txt])
+    response = await agent.prompt("s1", [_Img(), _Res(), _Link(), _Txt()])
     assert response.stop_reason == "end_turn"
     # The PromptIn reached the workflow update (recorded as args on the fake).
     args = _FakeHandle.updates_args[-1]
