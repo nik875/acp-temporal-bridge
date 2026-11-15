@@ -31,9 +31,7 @@ def test_image_prompt_builds_content_blocks() -> None:
 
 
 def test_image_prompt_without_text_keeps_images_only() -> None:
-    msg = _prompt_message(
-        PromptIn(text="", images=[ImageIn(data="QQ==", mime="image/webp")])
-    )
+    msg = _prompt_message(PromptIn(text="", images=[ImageIn(data="QQ==", mime="image/webp")]))
     assert msg.content == [
         {"type": "image_url", "image_url": {"url": "data:image/webp;base64,QQ=="}}
     ]

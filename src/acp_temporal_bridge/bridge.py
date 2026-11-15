@@ -91,6 +91,8 @@ def _bridge_version() -> str:
         return _v("acp-temporal-bridge")
     except PackageNotFoundError:  # pragma: no cover - odd installs
         return "0.0.0"
+
+
 TASK_QUEUE = os.environ.get("ACP_BRIDGE_TASK_QUEUE", "durable-agents")
 # Replay buffer bound: a loaded session replays at most this many events.
 # Emergency brake against a flooding turn (the 2026-10-26 flood published
@@ -127,21 +129,13 @@ REPLAY_MAX_ITEMS = 50000
 # a prompt 2s after an interrupt returned cancelled). An unknown
 # generation (workflow too old for the query / query failure) degrades to
 # v0.1.17 behavior: retry until turn_active reports False.
-CANCEL_RETRY_AFTER_SECS = float(
-    os.environ.get("ACP_BRIDGE_CANCEL_RETRY_AFTER_SECS", "5")
-)
-CANCEL_RETRY_BACKOFF_SECS = float(
-    os.environ.get("ACP_BRIDGE_CANCEL_RETRY_BACKOFF_SECS", "5")
-)
-CANCEL_RETRY_MAX_SECS = float(
-    os.environ.get("ACP_BRIDGE_CANCEL_RETRY_MAX_SECS", "300")
-)
+CANCEL_RETRY_AFTER_SECS = float(os.environ.get("ACP_BRIDGE_CANCEL_RETRY_AFTER_SECS", "5"))
+CANCEL_RETRY_BACKOFF_SECS = float(os.environ.get("ACP_BRIDGE_CANCEL_RETRY_BACKOFF_SECS", "5"))
+CANCEL_RETRY_MAX_SECS = float(os.environ.get("ACP_BRIDGE_CANCEL_RETRY_MAX_SECS", "300"))
 # UI-liveness heartbeat pacing (the workflow-side gate lives in session.py):
 # the bridge heartbeats every attached session this often. Kept well under
 # UI_STALE_SECS so a single lost beat never trips the gate.
-UI_HEARTBEAT_INTERVAL_SECS = float(
-    os.environ.get("ACP_BRIDGE_UI_HEARTBEAT_INTERVAL_SECS", "10")
-)
+UI_HEARTBEAT_INTERVAL_SECS = float(os.environ.get("ACP_BRIDGE_UI_HEARTBEAT_INTERVAL_SECS", "10"))
 
 
 def _consume_update_exception(task: asyncio.Task[None]) -> None:
@@ -179,6 +173,8 @@ def _is_closed_workflow(exc: BaseException) -> bool:
         stack.append(cur.__cause__)
         stack.append(cur.__context__)
     return False
+
+
 # History render bound: a load_session replays at most this many transcript
 # messages (oldest are dropped — the newest turns matter most on reattach).
 REPLAY_TRANSCRIPT_MESSAGES = 200
@@ -308,15 +304,9 @@ def translate_stream_item(item: Any) -> list[Any]:
             return []
         if kind == "message":
             return [
-                AgentMessageChunk(
-                    session_update="agent_message_chunk", content=text_block(text)
-                )
+                AgentMessageChunk(session_update="agent_message_chunk", content=text_block(text))
             ]
-        return [
-            AgentThoughtChunk(
-                session_update="agent_thought_chunk", content=text_block(text)
-            )
-        ]
+        return [AgentThoughtChunk(session_update="agent_thought_chunk", content=text_block(text))]
     if kind == "tool_start":
         return [
             ToolCallStart(
@@ -427,14 +417,12 @@ class BridgeAgent:
         self._ui_tasks.clear()
         for session_id, epoch in self._ui_epochs.items():
             with contextlib.suppress(tc.RPCError):
-                await self._temporal.get_workflow_handle(
-                    session_workflow_id(session_id)
-                ).signal(AgentSession.ui_detached, epoch)
+                await self._temporal.get_workflow_handle(session_workflow_id(session_id)).signal(
+                    AgentSession.ui_detached, epoch
+                )
         self._ui_epochs.clear()
         for session_id in self._created - self._prompted:
-            handle = self._temporal.get_workflow_handle(
-                session_workflow_id(session_id)
-            )
+            handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
             # Already gone (completed/expired/cancelled) is fine.
             with contextlib.suppress(tc.RPCError):
                 await handle.cancel()
@@ -457,9 +445,7 @@ class BridgeAgent:
                 # as extra text. Whether the MODEL can actually use images is
                 # the host's model choice — a text-only model surfaces its
                 # provider error verbatim (honest failure beats silent drop).
-                prompt_capabilities=PromptCapabilities(
-                    image=True, embedded_context=True
-                ),
+                prompt_capabilities=PromptCapabilities(image=True, embedded_context=True),
             ),
             agent_info=Implementation(
                 name="acp-temporal-bridge",
@@ -565,14 +551,10 @@ class BridgeAgent:
         self._ensure_ui_heartbeat(session_id)
         return LoadSessionResponse(session_id=session_id)
 
-    async def _replay_transcript(
-        self, session_id: str, handle: tc.WorkflowHandle
-    ) -> None:
+    async def _replay_transcript(self, session_id: str, handle: tc.WorkflowHandle) -> None:
         """Render durable transcript history as ACP message-chunk updates."""
         try:
-            tail = await handle.query(
-                AgentSession.transcript_tail, REPLAY_TRANSCRIPT_MESSAGES
-            )
+            tail = await handle.query(AgentSession.transcript_tail, REPLAY_TRANSCRIPT_MESSAGES)
         except tc.RPCError:
             return  # gone / query timeout: nothing to render
         for dump in (tail or {}).get("transcript", []) or []:
@@ -629,9 +611,7 @@ class BridgeAgent:
             existing.cancel()
         epoch = time.time_ns()
         self._ui_epochs[session_id] = epoch
-        self._ui_tasks[session_id] = asyncio.create_task(
-            self._ui_heartbeat_loop(session_id, epoch)
-        )
+        self._ui_tasks[session_id] = asyncio.create_task(self._ui_heartbeat_loop(session_id, epoch))
 
     async def _ui_heartbeat_loop(self, session_id: str, epoch: int) -> None:
         """Send ui_heartbeat(epoch) every UI_HEARTBEAT_INTERVAL_SECS.
@@ -651,12 +631,8 @@ class BridgeAgent:
                 # transient (worker gap, busy cluster): keep beating
             await asyncio.sleep(UI_HEARTBEAT_INTERVAL_SECS)
 
-    async def _tail_stream(
-        self, session_id: str, handle: tc.WorkflowHandle, offset: int
-    ) -> None:
-        stream = WorkflowStreamClient.create(
-            self._temporal, session_workflow_id(session_id)
-        )
+    async def _tail_stream(self, session_id: str, handle: tc.WorkflowHandle, offset: int) -> None:
+        stream = WorkflowStreamClient.create(self._temporal, session_workflow_id(session_id))
         count = 0
         async for item in stream.subscribe(STREAM_TOPIC, from_offset=offset):
             count += 1
@@ -696,7 +672,9 @@ class BridgeAgent:
     async def set_session_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> None:
         raise RuntimeError("session modes not supported")
 
-    async def set_config_option(self, session_id: str, name: str, value: Any, **kwargs: Any) -> None:
+    async def set_config_option(
+        self, session_id: str, name: str, value: Any, **kwargs: Any
+    ) -> None:
         raise RuntimeError("config options not supported")
 
     # -- prompt / cancel -----------------------------------------------------
@@ -719,10 +697,7 @@ class BridgeAgent:
                 images.append(
                     ImageIn(
                         data=str(block.data),
-                        mime=str(
-                            getattr(block, "mime_type", None)
-                            or "image/png"
-                        ),
+                        mime=str(getattr(block, "mime_type", None) or "image/png"),
                     )
                 )
             elif btype == "resource":
@@ -738,9 +713,7 @@ class BridgeAgent:
                         if isinstance(resource, dict)
                         else getattr(resource, "uri", "")
                     ) or "attached file"
-                    parts.append(
-                        f'<attached-file name="{name}">\n{inline_text}\n</attached-file>'
-                    )
+                    parts.append(f'<attached-file name="{name}">\n{inline_text}\n</attached-file>')
             elif btype == "resource_link":
                 name = getattr(block, "name", None) or getattr(block, "uri", "file")
                 mime = getattr(block, "mime_type", None) or ""
@@ -779,9 +752,7 @@ class BridgeAgent:
             await tail
         offset = self._offsets.get(session_id, 0)
         stop_reason = "end_turn"
-        stream = WorkflowStreamClient.create(
-            self._temporal, session_workflow_id(session_id)
-        )
+        stream = WorkflowStreamClient.create(self._temporal, session_workflow_id(session_id))
         count = 0
         halting = False
         async for item in stream.subscribe(STREAM_TOPIC, from_offset=offset):
@@ -815,10 +786,10 @@ class BridgeAgent:
                     # e.g. "error" from a failed turn: the durable record is
                     # honest, the ACP surface is an error (StopReason is a
                     # closed Literal — pydantic would reject "error").
-                    raise RequestError.internal_error(                        {
+                    raise RequestError.internal_error(
+                        {
                             "details": (
-                                f"session {session_id}: turn ended with "
-                                f"stop_reason={reason!r}"
+                                f"session {session_id}: turn ended with " f"stop_reason={reason!r}"
                             ),
                             "stop_reason": reason,
                         }
@@ -923,9 +894,7 @@ class BridgeAgent:
         self._cancel_watchdogs.add(redriver)
         redriver.add_done_callback(self._cancel_watchdogs.discard)
 
-    async def _cancel_redriver(
-        self, handle: tc.WorkflowHandle, generation: int | None
-    ) -> None:
+    async def _cancel_redriver(self, handle: tc.WorkflowHandle, generation: int | None) -> None:
         """Re-send the cancel update until the interrupted turn is stopped.
 
         No terminate exists on this path — the session outlives every

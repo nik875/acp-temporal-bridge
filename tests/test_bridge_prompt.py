@@ -69,6 +69,7 @@ def _use_stream(monkeypatch: pytest.MonkeyPatch, items: list[_Item]) -> None:
         @staticmethod
         def create(client: Any, workflow_id: str) -> _Stream:
             return _Stream()
+
         async def subscribe(self, topic: str, from_offset: int = 0) -> Any:
             for item in items:
                 if item.offset >= from_offset:
@@ -106,10 +107,7 @@ async def test_overflow_drains_past_halted_turn_end(
     _use_stream(
         monkeypatch,
         [
-            *(
-                _Item({"kind": "message", "text": "x"}, i)
-                for i in range(max_items + 1)
-            ),
+            *(_Item({"kind": "message", "text": "x"}, i) for i in range(max_items + 1)),
             _Item({"kind": "turn_end", "stop_reason": "cancelled"}, max_items + 1),
         ],
     )
@@ -186,9 +184,7 @@ class _CancelRecordingTemporal:
 def _cancelling_agent() -> tuple[BridgeAgent, _FakeConn, _CancelRecordingTemporal]:
     from acp_temporal_bridge import SessionSpec, configure
 
-    configure(
-        default_spec=SessionSpec(model="mock", system_prompt="e2e", tools=["echo"])
-    )
+    configure(default_spec=SessionSpec(model="mock", system_prompt="e2e", tools=["echo"]))
     conn = _FakeConn()
     temporal = _CancelRecordingTemporal()
     return BridgeAgent(conn, temporal), conn, temporal
@@ -211,9 +207,7 @@ async def test_aclose_keeps_prompted_sessions(
 ) -> None:
     """A prompted session survives disconnect — the client may reconnect and
     reattach (the durability promise). Only the empty probes get cancelled."""
-    _use_stream(
-        monkeypatch, [_Item({"kind": "turn_end", "stop_reason": "end_turn"}, 0)]
-    )
+    _use_stream(monkeypatch, [_Item({"kind": "turn_end", "stop_reason": "end_turn"}, 0)])
     agent, _conn, temporal = _cancelling_agent()
     sid = await agent.new_session(cwd="~")
     await agent.prompt(sid.session_id, [])
