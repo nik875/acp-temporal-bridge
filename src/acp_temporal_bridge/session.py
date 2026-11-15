@@ -157,9 +157,24 @@ def session_workflow_id(session_id: str) -> str:
 
 
 @dataclasses.dataclass
+class ImageIn:
+    """One inline image attached to a prompt (ACP ImageContentBlock)."""
+
+    data: str  # base64, no data: prefix
+    mime: str  # e.g. image/png
+
+
+@dataclasses.dataclass
 class PromptIn:
     text: str
     kind: str = "user"  # user | system (e.g. pr_merged wakes)
+    # Inline images from ACP prompt blocks (v0.1.20). Empty for old callers;
+    # temporalio encodes the dataclass into history, so the field must stay
+    # JSON-safe (list of dicts-worth of primitives) for replay compat.
+    images: list[ImageIn] = dataclasses.field(default_factory=list)
+    # Names/mimes of files the client attached as resource_links (the bytes
+    # stay client-side; we can only tell the model they exist).
+    attached_files: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -373,6 +388,51 @@ def _stream_state_with_tail(
         base_offset=state.base_offset + drop,
         publishers=state.publishers,
     )
+
+
+def _prompt_message(prompt: PromptIn) -> HumanMessage:
+    """The turn's human message from a prompt (v0.1.20 multimodal).
+
+    With images: langchain content blocks (text + OpenAI-style image_url data
+    URIs — the OpenAI-compatible provider forwards them; a text-only model
+    surfaces its provider error verbatim, an honest failure). Attached files
+    the worker cannot read are named so the model knows they exist. Plain
+    prompts stay plain string content — replay-identical to pre-0.1.20.
+    """
+    if prompt.images:
+        content: list[dict[str, Any]] = []
+        if prompt.text.strip():
+            content.append({"type": "text", "text": prompt.text})
+        for image in prompt.images:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{image.mime};base64,{image.data}"},
+                }
+            )
+        if prompt.attached_files:
+            content.append(
+                {
+                    "type": "text",
+                    "text": "(The user also attached these files, which are "
+                    "not readable in this session: "
+                    + "; ".join(prompt.attached_files)
+                    + ")",
+                }
+            )
+        return HumanMessage(content=content)
+    if prompt.attached_files:
+        return HumanMessage(
+            content=(
+                prompt.text
+                + "\n\n(The user also attached these files, which are not "
+                "readable in this session: "
+                + "; ".join(prompt.attached_files)
+                + ")"
+            ).strip()
+        )
+    return HumanMessage(content=prompt.text)
+
 
 
 @workflow.defn
@@ -741,7 +801,7 @@ class AgentSession:
         config = {"configurable": {"thread_id": workflow.info().workflow_id}}
         human: HumanMessage | None = None
         if text is not None:
-            human = HumanMessage(content=text)
+            human = _prompt_message(prompt)
         elif not self._transcript:
             # Resume with nothing to resume FROM: a caller error, not a
             # model call — fail the turn honestly.

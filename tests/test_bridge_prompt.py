@@ -36,9 +36,11 @@ class _Item:
 
 class _FakeHandle:
     updates: ClassVar[list[Any]] = []
+    updates_args: ClassVar[list[Any]] = []
 
     async def execute_update(self, *args: Any, **kwargs: Any) -> None:
         _FakeHandle.updates.append(args[0] if args else None)
+        _FakeHandle.updates_args.append(args[1] if len(args) > 1 else None)
 
     async def signal(self, *args: Any, **kwargs: Any) -> None:
         _FakeHandle.updates.append(("signal", args[0] if args else None))
@@ -217,3 +219,50 @@ async def test_aclose_keeps_prompted_sessions(
     await agent.prompt(sid.session_id, [])
     await agent.aclose()
     assert temporal.cancels == []
+
+
+async def test_prompt_forwards_image_and_resource_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Image blocks become PromptIn.images; inline text resources become part
+    of the text; resource_links are named so the model knows they exist.
+
+    Regression for the AgentWebUI image-send break: the bridge used to join
+    ONLY text blocks and silently drop every attachment."""
+    _use_stream(monkeypatch, [_Item({"kind": "turn_end", "stop_reason": "end_turn"}, 0)])
+    agent, _conn = _agent()
+
+    class _Img:
+        type = "image"
+        data = "aGVsbG8="
+        mime_type = "image/webp"
+
+    class _Res:
+        type = "resource"
+        resource = {
+            "uri": "file:///x/note.txt",
+            "mimeType": "text/plain",
+            "text": "hello from note",
+        }
+
+    class _Link:
+        type = "resource_link"
+        uri = "file:///x/big.pdf"
+        name = "big.pdf"
+        mime_type = "application/pdf"
+
+    class _Txt:
+        type = "text"
+        text = "what is in these?"
+
+    response = await agent.prompt("s1", [_Img, _Res, _Link, _Txt])
+    assert response.stop_reason == "end_turn"
+    sent = [u for u in _FakeHandle.updates if not callable(u)]
+    # The PromptIn reached the workflow update (recorded as args on the fake).
+    args = _FakeHandle.updates_args[-1]
+    assert "what is in these?" in args.text
+    assert '<attached-file name="file:///x/note.txt">' in args.text
+    assert args.text.index("<attached-file") < args.text.index("what is in these?")
+    assert [i.data for i in args.images] == ["aGVsbG8="]
+    assert [i.mime for i in args.images] == ["image/webp"]
+    assert args.attached_files == ["big.pdf (application/pdf)"]

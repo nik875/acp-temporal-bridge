@@ -56,6 +56,7 @@ from acp.schema import (
     NewSessionResponse,
     PermissionOption,
     PlanEntry,
+    PromptCapabilities,
     PromptResponse,
     SessionInfo,
     StopReason,
@@ -72,6 +73,7 @@ from ._config import get_default_spec, get_tool_builder
 from .session import (
     STREAM_TOPIC,
     AgentSession,
+    ImageIn,
     PromptIn,
     SessionStart,
     session_workflow_id,
@@ -448,7 +450,17 @@ class BridgeAgent:
     ) -> InitializeResponse:
         return InitializeResponse(
             protocol_version=protocol_version,
-            agent_capabilities=AgentCapabilities(load_session=True),
+            agent_capabilities=AgentCapabilities(
+                load_session=True,
+                # Inline images + text-file context: the bridge forwards image
+                # blocks as multimodal model input and inline text resources
+                # as extra text. Whether the MODEL can actually use images is
+                # the host's model choice — a text-only model surfaces its
+                # provider error verbatim (honest failure beats silent drop).
+                prompt_capabilities=PromptCapabilities(
+                    image=True, embedded_context=True
+                ),
+            ),
             agent_info=Implementation(
                 name="acp-temporal-bridge",
                 version=_bridge_version(),
@@ -690,15 +702,58 @@ class BridgeAgent:
     # -- prompt / cancel -----------------------------------------------------
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> PromptResponse:
-        text = "".join(
-            block.text
-            for block in prompt
-            if getattr(block, "type", None) == "text" and getattr(block, "text", "")
-        )
+        # v0.1.20: inline images and text-file context. ACP image blocks carry
+        # base64 data (the UI read the bytes; the worker cannot reach the
+        # client filesystem, so inline is the only path). Resource blocks with
+        # inline text are embedded as fenced text; resource_links (bytes stay
+        # client-side) are surfaced to the model as names only. Text parts
+        # keep their arrival order (files usually precede the message text).
+        parts: list[str] = []
+        images: list[ImageIn] = []
+        attached: list[str] = []
+        for block in prompt:
+            btype = getattr(block, "type", None)
+            if btype == "text" and getattr(block, "text", ""):
+                parts.append(str(block.text))
+            elif btype == "image" and getattr(block, "data", ""):
+                images.append(
+                    ImageIn(
+                        data=str(block.data),
+                        mime=str(
+                            getattr(block, "mime_type", None)
+                            or "image/png"
+                        ),
+                    )
+                )
+            elif btype == "resource":
+                resource = getattr(block, "resource", None)
+                inline_text = (
+                    resource.get("text")
+                    if isinstance(resource, dict)
+                    else getattr(resource, "text", None)
+                )
+                if isinstance(inline_text, str) and inline_text:
+                    name = (
+                        resource.get("uri")
+                        if isinstance(resource, dict)
+                        else getattr(resource, "uri", "")
+                    ) or "attached file"
+                    parts.append(
+                        f'<attached-file name="{name}">\n{inline_text}\n</attached-file>'
+                    )
+            elif btype == "resource_link":
+                name = getattr(block, "name", None) or getattr(block, "uri", "file")
+                mime = getattr(block, "mime_type", None) or ""
+                attached.append(f"{name} ({mime})" if mime else str(name))
+        text = "\n\n".join(parts)
+
         handle = self._temporal.get_workflow_handle(session_workflow_id(session_id))
         self._prompted.add(session_id)
         try:
-            await handle.execute_update(AgentSession.prompt, PromptIn(text=text))
+            await handle.execute_update(
+                AgentSession.prompt,
+                PromptIn(text=text, images=images, attached_files=attached),
+            )
         except tc.RPCError as e:
             if not _is_closed_workflow(e):
                 raise
@@ -707,7 +762,10 @@ class BridgeAgent:
             # client only ever sees a working session, never the -32603
             # brick.
             handle = await self._recreate_closed_session(session_id)
-            await handle.execute_update(AgentSession.prompt, PromptIn(text=text))
+            await handle.execute_update(
+                AgentSession.prompt,
+                PromptIn(text=text, images=images, attached_files=attached),
+            )
         # Defensive re-arm: if the heartbeat loop died with a previously
         # closed workflow (recreate above), a fresh one must exist BEFORE
         # this turn starts — once the gate is armed, a turn must never run
