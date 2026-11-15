@@ -251,7 +251,6 @@ async def test_prompt_forwards_image_and_resource_blocks(
 
     response = await agent.prompt("s1", [_Img, _Res, _Link, _Txt])
     assert response.stop_reason == "end_turn"
-    sent = [u for u in _FakeHandle.updates if not callable(u)]
     # The PromptIn reached the workflow update (recorded as args on the fake).
     args = _FakeHandle.updates_args[-1]
     assert "what is in these?" in args.text
