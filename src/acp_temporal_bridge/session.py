@@ -58,7 +58,13 @@ with workflow.unsafe.imports_passed_through():
     # fresh copies — configure() is called at host import time, before any
     # sandbox import, and a fresh sandbox copy would see None seams.
     from . import policy
-    from ._config import SessionSpec, get_backend_builder, get_tool_builder
+    from ._config import (
+        SessionSpec,
+        get_backend_builder,
+        get_memory_sources,
+        get_tool_builder,
+    )
+    from .compaction_middleware import compaction_middleware
 
 MODEL_START_TO_CLOSE_SECS = 600
 # Heartbeat the model activity so a slow/hung LLM call doesn't look dead.
@@ -66,9 +72,7 @@ MODEL_START_TO_CLOSE_SECS = 600
 # heartbeat_timeout; without it, a model call outlasting the infra's
 # patience (LB idle timeouts, kill-tests) zombie-runs until
 # start_to_close while the workflow already retried elsewhere.
-MODEL_HEARTBEAT_TIMEOUT_SECS = int(
-    os.environ.get("ACP_BRIDGE_MODEL_HEARTBEAT_TIMEOUT_SECS", "30")
-)
+MODEL_HEARTBEAT_TIMEOUT_SECS = int(os.environ.get("ACP_BRIDGE_MODEL_HEARTBEAT_TIMEOUT_SECS", "30"))
 # Cap model-activity retries. With no retry policy, Temporal retries
 # forever — a degenerate model streaming garbage floods the durable log
 # on every attempt (observed: 10k+ items in ~2.5 min, workflow poisoned
@@ -98,13 +102,9 @@ MAX_GATES_PER_RUN = 10
 # truncation resync natively (WorkflowStreamClient.subscribe handles the
 # TruncatedOffset error). These values exceed any legitimate turn by a
 # wide margin — 16,401 was 86% noise; real content was 2,292 entries.
-STREAM_LOG_TRIM_THRESHOLD = int(
-    os.environ.get("ACP_BRIDGE_STREAM_LOG_TRIM_THRESHOLD", "2000")
-)
+STREAM_LOG_TRIM_THRESHOLD = int(os.environ.get("ACP_BRIDGE_STREAM_LOG_TRIM_THRESHOLD", "2000"))
 STREAM_LOG_TRIM_KEEP = int(os.environ.get("ACP_BRIDGE_STREAM_LOG_TRIM_KEEP", "1000"))
-STREAM_JANITOR_TICK_SECS = float(
-    os.environ.get("ACP_BRIDGE_STREAM_JANITOR_TICK_SECS", "20")
-)
+STREAM_JANITOR_TICK_SECS = float(os.environ.get("ACP_BRIDGE_STREAM_JANITOR_TICK_SECS", "20"))
 # Idle-session expiry. The bridge starts one workflow per ACP session/new and
 # nothing else completes a never-prompted one (observed 2026-10-26: 104
 # RUNNING sessions in 33 h, 66 of them zero-content — paseo probes and
@@ -117,12 +117,8 @@ STREAM_JANITOR_TICK_SECS = float(
 # None->positive timer switch is a nondeterminism hazard for histories
 # recorded before this change (temporalio wait_condition docstring), so old
 # runs keep the unbounded wait until their next CAN starts a fresh history.
-IDLE_EXPIRY_NEVER_PROMPTED_SECS = int(
-    os.environ.get("ACP_BRIDGE_IDLE_EXPIRY_NEW_SECS", "3600")
-)
-IDLE_EXPIRY_PROMPTED_SECS = int(
-    os.environ.get("ACP_BRIDGE_IDLE_EXPIRY_SECS", str(7 * 24 * 3600))
-)
+IDLE_EXPIRY_NEVER_PROMPTED_SECS = int(os.environ.get("ACP_BRIDGE_IDLE_EXPIRY_NEW_SECS", "3600"))
+IDLE_EXPIRY_PROMPTED_SECS = int(os.environ.get("ACP_BRIDGE_IDLE_EXPIRY_SECS", str(7 * 24 * 3600)))
 # UI-liveness gate — the "an agent may never continue without streaming to
 # the UI" invariant (2026-10-28 decision): the bridge sends
 # ui_heartbeat(epoch) signals while a client is attached, ui_detached(epoch)
@@ -133,13 +129,9 @@ IDLE_EXPIRY_PROMPTED_SECS = int(
 # (stop_reason="error"); session and transcript always survive.
 # Gated by workflow.patched("bridge.ui-gate") for old histories (same
 # None->positive-timer hazard as idle-expiry above).
-UI_HEARTBEAT_INTERVAL_SECS = float(
-    os.environ.get("ACP_BRIDGE_UI_HEARTBEAT_INTERVAL_SECS", "10")
-)
+UI_HEARTBEAT_INTERVAL_SECS = float(os.environ.get("ACP_BRIDGE_UI_HEARTBEAT_INTERVAL_SECS", "10"))
 UI_STALE_SECS = float(os.environ.get("ACP_BRIDGE_UI_STALE_SECS", "45"))
-UI_LOST_TURN_BUDGET_SECS = float(
-    os.environ.get("ACP_BRIDGE_UI_LOST_TURN_BUDGET_SECS", "3600")
-)
+UI_LOST_TURN_BUDGET_SECS = float(os.environ.get("ACP_BRIDGE_UI_LOST_TURN_BUDGET_SECS", "3600"))
 # Workflow ids are prefixed so external components can distinguish session
 # workflows from others on the queue.
 WORKFLOW_PREFIX = os.environ.get("ACP_BRIDGE_WORKFLOW_PREFIX", "agent-")
@@ -151,9 +143,24 @@ def session_workflow_id(session_id: str) -> str:
 
 
 @dataclasses.dataclass
+class ImageIn:
+    """One inline image attached to a prompt (ACP ImageContentBlock)."""
+
+    data: str  # base64, no data: prefix
+    mime: str  # e.g. image/png
+
+
+@dataclasses.dataclass
 class PromptIn:
     text: str
     kind: str = "user"  # user | system (e.g. pr_merged wakes)
+    # Inline images from ACP prompt blocks (v0.1.20). Empty for old callers;
+    # temporalio encodes the dataclass into history, so the field must stay
+    # JSON-safe (list of dicts-worth of primitives) for replay compat.
+    images: list[ImageIn] = dataclasses.field(default_factory=list)
+    # Names/mimes of files the client attached as resource_links (the bytes
+    # stay client-side; we can only tell the model they exist).
+    attached_files: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -228,9 +235,7 @@ class _CanGuardModel(TemporalModel):
     ) -> Any:
         self._check_budget()
         await self._wait_ui()
-        return await super()._agenerate(
-            messages, stop=stop, run_manager=run_manager, **kwargs
-        )
+        return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
     async def _astream(
         self,
@@ -241,9 +246,7 @@ class _CanGuardModel(TemporalModel):
     ) -> Any:
         self._check_budget()
         await self._wait_ui()
-        async for chunk in super()._astream(
-            messages, stop=stop, run_manager=run_manager, **kwargs
-        ):
+        async for chunk in super()._astream(messages, stop=stop, run_manager=run_manager, **kwargs):
             yield chunk
 
     async def _wait_ui(self) -> None:
@@ -338,8 +341,7 @@ def _bound_transcript(
             content = d["data"]["content"]
             data = dict(d["data"])
             data["content"] = (
-                content[:output_cap]
-                + f"...[truncated, {len(content) - output_cap} chars dropped]"
+                content[:output_cap] + f"...[truncated, {len(content) - output_cap} chars dropped]"
             )
             bounded.append({**d, "data": data})
         else:
@@ -347,9 +349,7 @@ def _bound_transcript(
     return bounded
 
 
-def _stream_state_with_tail(
-    state: WorkflowStreamState, keep: int
-) -> WorkflowStreamState:
+def _stream_state_with_tail(state: WorkflowStreamState, keep: int) -> WorkflowStreamState:
     """Carry only the newest `keep` log entries across CAN.
 
     Offsets stay monotonic: base_offset advances with the dropped prefix.
@@ -367,6 +367,45 @@ def _stream_state_with_tail(
         base_offset=state.base_offset + drop,
         publishers=state.publishers,
     )
+
+
+def _prompt_message(prompt: PromptIn) -> HumanMessage:
+    """The turn's human message from a prompt (v0.1.20 multimodal).
+
+    With images: langchain content blocks (text + OpenAI-style image_url data
+    URIs — the OpenAI-compatible provider forwards them; a text-only model
+    surfaces its provider error verbatim, an honest failure). Attached files
+    the worker cannot read are named so the model knows they exist. Plain
+    prompts stay plain string content — replay-identical to pre-0.1.20.
+    """
+    if prompt.images:
+        content: list[dict[str, Any]] = []
+        if prompt.text.strip():
+            content.append({"type": "text", "text": prompt.text})
+        for image in prompt.images:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{image.mime};base64,{image.data}"},
+                }
+            )
+        if prompt.attached_files:
+            content.append(
+                {
+                    "type": "text",
+                    "text": "(The user also attached these files, which are "
+                    "not readable in this session: " + "; ".join(prompt.attached_files) + ")",
+                }
+            )
+        return HumanMessage(content=content)
+    if prompt.attached_files:
+        return HumanMessage(
+            content=(
+                prompt.text + "\n\n(The user also attached these files, which are not "
+                "readable in this session: " + "; ".join(prompt.attached_files) + ")"
+            ).strip()
+        )
+    return HumanMessage(content=prompt.text)
 
 
 @workflow.defn
@@ -459,7 +498,11 @@ class AgentSession:
                 # fails the turn, never the session.
                 task = asyncio.create_task(
                     self._gated_turn(
-                        run, prompt.text, start.force_mid_turn_can, "turn start"
+                        run,
+                        prompt.text,
+                        start.force_mid_turn_can,
+                        "turn start",
+                        prompt,
                     )
                 )
             self._turn_count += 1
@@ -499,8 +542,7 @@ class AgentSession:
             # turn_end when it actually completes.
             _publish(self._stream, {"kind": "turn_end", "stop_reason": stop_reason})
             if (
-                start.force_can_after_turns
-                and self._turn_count >= start.force_can_after_turns
+                start.force_can_after_turns and self._turn_count >= start.force_can_after_turns
             ) or workflow.info().is_continue_as_new_suggested():
                 # CAN at the turn boundary. The stream log + transcript are
                 # carried; the in-memory checkpointer is discarded by design.
@@ -656,9 +698,7 @@ class AgentSession:
         try:
             workflow.continue_as_new(args=args)
         except Exception:  # noqa: BLE001 — handled: log + retry with minimal tail
-            workflow.logger.exception(
-                "bounded CAN rejected; retrying with the minimal stream tail"
-            )
+            workflow.logger.exception("bounded CAN rejected; retrying with the minimal stream tail")
             workflow.continue_as_new(
                 args=[
                     start,
@@ -671,22 +711,28 @@ class AgentSession:
     def _can_size(args: list[Any]) -> int:
         """Serialized size of the CAN args, measured exactly as the SDK
         will send them. Deterministic — safe under replay."""
-        return sum(
-            len(p.data or b"")
-            for p in workflow.payload_converter().to_payloads(args)
-        )
+        return sum(len(p.data or b"") for p in workflow.payload_converter().to_payloads(args))
 
     async def _gated_turn(
-        self, run: SessionSpec, text: str | None, force_mid_turn: bool, gate: str
+        self,
+        run: SessionSpec,
+        text: str | None,
+        force_mid_turn: bool,
+        gate: str,
+        prompt: PromptIn | None = None,
     ) -> None:
         """UI-liveness gate + turn, as one task so a gate failure is caught
         by run()'s turn-exception handlers (turn_end stop_reason="error",
         session survives) instead of escaping into run() itself."""
         await self._wait_ui(gate)
-        await self._turn(run, text, force_mid_turn)
+        await self._turn(run, text, force_mid_turn, prompt)
 
     async def _turn(
-        self, run: SessionSpec, text: str | None, force_mid_turn: bool = False
+        self,
+        run: SessionSpec,
+        text: str | None,
+        force_mid_turn: bool = False,
+        prompt: PromptIn | None = None,
     ) -> None:
         """One agent turn: stream events to the bridge topic, keep transcript.
 
@@ -715,18 +761,27 @@ class AgentSession:
         # default — virtual files in workflow state. The builder runs in-
         # workflow; a TemporalBackend wrapper's ops dispatch out as activities.
         backend = get_backend_builder()() if get_backend_builder() else None
+        # Shared compaction factory (tests/test_path_parity.py guards that BOTH
+        # paths -- this interactive one and the headless DurableAgent -- route
+        # through it with the registry-sourced trigger).
+        middleware = compaction_middleware(model, backend, run.compact_at_tokens)
+        # Memory files (host seam) are injected into the system prompt every
+        # turn by deepagents' memory middleware; None keeps the default.
+        memory = get_memory_sources()
         agent = create_temporal_deep_agent(
             model=model,
             system_prompt=run.system_prompt,
             tools=get_tool_builder()(list(run.tools)),
             backend=backend,
+            middleware=middleware,
+            memory=memory,
             interrupt_on=policy.build_interrupt_on(list(run.tools)),
             checkpointer=self._checkpointer(),
         )
         config = {"configurable": {"thread_id": workflow.info().workflow_id}}
         human: HumanMessage | None = None
         if text is not None:
-            human = HumanMessage(content=text)
+            human = _prompt_message(prompt or PromptIn(text=text))
         elif not self._transcript:
             # Resume with nothing to resume FROM: a caller error, not a
             # model call — fail the turn honestly.
@@ -769,9 +824,7 @@ class AgentSession:
                 # HITL gate: durable pause, then resume with the decision.
                 self._gates += 1
                 if self._gates > MAX_GATES_PER_RUN:
-                    raise ApplicationError(
-                        "too many approval gates in one run", non_retryable=True
-                    )
+                    raise ApplicationError("too many approval gates in one run", non_retryable=True)
                 self._pending = policy.pending_from_interrupt(interrupt[0])
                 # Surface the gate on the durable stream BEFORE pausing, so
                 # the bridge (live or replaying) sees what is being waited
@@ -947,9 +1000,7 @@ class AgentSession:
                 f"invalid action {action!r}: must be 'approve' or 'respond'",
                 non_retryable=True,
             )
-        self._decision = policy.ApprovalDecision(
-            action=action, response=decision.get("response")
-        )
+        self._decision = policy.ApprovalDecision(action=action, response=decision.get("response"))
 
 
 def _serialize(messages: list[BaseMessage]) -> list[dict[str, Any]]:

@@ -36,9 +36,11 @@ class _Item:
 
 class _FakeHandle:
     updates: ClassVar[list[Any]] = []
+    updates_args: ClassVar[list[Any]] = []
 
     async def execute_update(self, *args: Any, **kwargs: Any) -> None:
         _FakeHandle.updates.append(args[0] if args else None)
+        _FakeHandle.updates_args.append(args[1] if len(args) > 1 else None)
 
     async def signal(self, *args: Any, **kwargs: Any) -> None:
         _FakeHandle.updates.append(("signal", args[0] if args else None))
@@ -67,6 +69,7 @@ def _use_stream(monkeypatch: pytest.MonkeyPatch, items: list[_Item]) -> None:
         @staticmethod
         def create(client: Any, workflow_id: str) -> _Stream:
             return _Stream()
+
         async def subscribe(self, topic: str, from_offset: int = 0) -> Any:
             for item in items:
                 if item.offset >= from_offset:
@@ -104,10 +107,7 @@ async def test_overflow_drains_past_halted_turn_end(
     _use_stream(
         monkeypatch,
         [
-            *(
-                _Item({"kind": "message", "text": "x"}, i)
-                for i in range(max_items + 1)
-            ),
+            *(_Item({"kind": "message", "text": "x"}, i) for i in range(max_items + 1)),
             _Item({"kind": "turn_end", "stop_reason": "cancelled"}, max_items + 1),
         ],
     )
@@ -184,9 +184,7 @@ class _CancelRecordingTemporal:
 def _cancelling_agent() -> tuple[BridgeAgent, _FakeConn, _CancelRecordingTemporal]:
     from acp_temporal_bridge import SessionSpec, configure
 
-    configure(
-        default_spec=SessionSpec(model="mock", system_prompt="e2e", tools=["echo"])
-    )
+    configure(default_spec=SessionSpec(model="mock", system_prompt="e2e", tools=["echo"]))
     conn = _FakeConn()
     temporal = _CancelRecordingTemporal()
     return BridgeAgent(conn, temporal), conn, temporal
@@ -209,11 +207,57 @@ async def test_aclose_keeps_prompted_sessions(
 ) -> None:
     """A prompted session survives disconnect — the client may reconnect and
     reattach (the durability promise). Only the empty probes get cancelled."""
-    _use_stream(
-        monkeypatch, [_Item({"kind": "turn_end", "stop_reason": "end_turn"}, 0)]
-    )
+    _use_stream(monkeypatch, [_Item({"kind": "turn_end", "stop_reason": "end_turn"}, 0)])
     agent, _conn, temporal = _cancelling_agent()
     sid = await agent.new_session(cwd="~")
     await agent.prompt(sid.session_id, [])
     await agent.aclose()
     assert temporal.cancels == []
+
+
+async def test_prompt_forwards_image_and_resource_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Image blocks become PromptIn.images; inline text resources become part
+    of the text; resource_links are named so the model knows they exist.
+
+    Regression for the AgentWebUI image-send break: the bridge used to join
+    ONLY text blocks and silently drop every attachment."""
+    _use_stream(monkeypatch, [_Item({"kind": "turn_end", "stop_reason": "end_turn"}, 0)])
+    agent, _conn = _agent()
+
+    class _Img:
+        type = "image"
+        data = "aGVsbG8="
+        mime_type = "image/webp"
+
+    class _Res:
+        type = "resource"
+
+        def __init__(self) -> None:
+            self.resource = {
+                "uri": "file:///x/note.txt",
+                "mimeType": "text/plain",
+                "text": "hello from note",
+            }
+
+    class _Link:
+        type = "resource_link"
+        uri = "file:///x/big.pdf"
+        name = "big.pdf"
+        mime_type = "application/pdf"
+
+    class _Txt:
+        type = "text"
+        text = "what is in these?"
+
+    response = await agent.prompt("s1", [_Img(), _Res(), _Link(), _Txt()])
+    assert response.stop_reason == "end_turn"
+    # The PromptIn reached the workflow update (recorded as args on the fake).
+    args = _FakeHandle.updates_args[-1]
+    assert "what is in these?" in args.text
+    assert '<attached-file name="file:///x/note.txt">' in args.text
+    assert args.text.index("<attached-file") < args.text.index("what is in these?")
+    assert [i.data for i in args.images] == ["aGVsbG8="]
+    assert [i.mime for i in args.images] == ["image/webp"]
+    assert args.attached_files == ["big.pdf (application/pdf)"]
