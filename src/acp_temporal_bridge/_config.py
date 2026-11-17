@@ -49,6 +49,12 @@ class SessionSpec:
     # auto-compaction. Registry-sourced (host: AGENTS[name].compact_at_tokens);
     # a default so pre-existing histories (no field) replay unchanged.
     compact_at_tokens: int | None = None
+    # Autonomous sessions run headless: no ACP client attaches, so the
+    # UI-liveness gate is bypassed entirely and the idle window is widened to
+    # AUTONOMOUS_IDLE_BUDGET_SECS (see session.py). Registry-sourced (host:
+    # AGENTS[name].autonomous); a default so pre-existing histories (no field)
+    # replay unchanged as non-autonomous.
+    autonomous: bool = False
 
 
 _tool_builder: TOOL_BUILDER | None = None

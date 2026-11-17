@@ -119,6 +119,14 @@ STREAM_JANITOR_TICK_SECS = float(os.environ.get("ACP_BRIDGE_STREAM_JANITOR_TICK_
 # runs keep the unbounded wait until their next CAN starts a fresh history.
 IDLE_EXPIRY_NEVER_PROMPTED_SECS = int(os.environ.get("ACP_BRIDGE_IDLE_EXPIRY_NEW_SECS", "3600"))
 IDLE_EXPIRY_PROMPTED_SECS = int(os.environ.get("ACP_BRIDGE_IDLE_EXPIRY_SECS", str(7 * 24 * 3600)))
+# Autonomous sessions (SessionSpec.autonomous) run headless — no ACP client,
+# no bridge heartbeats — so they get a single wide idle budget instead of the
+# never-prompted/prompted split: a never-prompted autonomous session is a
+# deliberate kickoff (not a probe), and its transcript is the audit trail.
+# 30 days, not "never": a leaked kickoff still reaps eventually.
+AUTONOMOUS_IDLE_BUDGET_SECS = int(
+    os.environ.get("ACP_BRIDGE_AUTONOMOUS_IDLE_SECS", str(30 * 24 * 3600))
+)
 # UI-liveness gate — the "an agent may never continue without streaming to
 # the UI" invariant (2026-10-28 decision): the bridge sends
 # ui_heartbeat(epoch) signals while a client is attached, ui_detached(epoch)
@@ -465,9 +473,13 @@ class AgentSession:
                 )
             else:
                 budget = start.force_idle_expiry_secs or (
-                    IDLE_EXPIRY_NEVER_PROMPTED_SECS
-                    if not self._transcript
-                    else IDLE_EXPIRY_PROMPTED_SECS
+                    AUTONOMOUS_IDLE_BUDGET_SECS
+                    if run.autonomous
+                    else (
+                        IDLE_EXPIRY_NEVER_PROMPTED_SECS
+                        if not self._transcript
+                        else IDLE_EXPIRY_PROMPTED_SECS
+                    )
                 )
                 if workflow.patched("bridge.idle-expiry"):
                     try:
@@ -723,8 +735,13 @@ class AgentSession:
     ) -> None:
         """UI-liveness gate + turn, as one task so a gate failure is caught
         by run()'s turn-exception handlers (turn_end stop_reason="error",
-        session survives) instead of escaping into run() itself."""
-        await self._wait_ui(gate)
+        session survives) instead of escaping into run() itself.
+
+        Autonomous sessions bypass the gate: nothing attaches a UI to them,
+        so a gate here would pause forever waiting for heartbeats that never
+        come (and, once the bridge is retired, never will)."""
+        if not run.autonomous:
+            await self._wait_ui(gate)
         await self._turn(run, text, force_mid_turn, prompt)
 
     async def _turn(
@@ -748,8 +765,13 @@ class AgentSession:
             force=(text is not None) and force_mid_turn,
             # UI-liveness gate before EVERY model call (the invariant: no
             # model call proceeds without a live UI to stream to). None for
-            # unpatched histories keeps old runs replay-safe.
-            ui_gate=self._wait_ui if workflow.patched("bridge.ui-gate") else None,
+            # unpatched histories keeps old runs replay-safe; None for
+            # autonomous sessions (headless — see _gated_turn).
+            ui_gate=(
+                None
+                if run.autonomous or not workflow.patched("bridge.ui-gate")
+                else self._wait_ui
+            ),
             activity_options={
                 "start_to_close_timeout": timedelta(seconds=MODEL_START_TO_CLOSE_SECS),
                 "heartbeat_timeout": timedelta(seconds=MODEL_HEARTBEAT_TIMEOUT_SECS),

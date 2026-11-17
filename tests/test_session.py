@@ -23,6 +23,7 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.deepagents import DeepAgentsPlugin
     from temporalio.deepagents.testing import MockTool, mock_model_provider
 
+import acp_temporal_bridge.session as session_mod
 from acp_temporal_bridge import (
     AgentSession,
     PromptIn,
@@ -462,5 +463,45 @@ async def test_prompted_session_expires_after_idle_budget() -> None:
         assert events[-1]["kind"] == "turn_end"
         # The idle wait after the turn expires into a clean completion.
         await handle.result()
+        info = await handle.describe()
+        assert info.status.name == "COMPLETED"
+
+
+async def test_autonomous_session_uses_autonomous_idle_budget(
+    monkeypatch: Any,
+) -> None:
+    """Autonomous sessions get ONE wide idle budget, not the
+    never-prompted/prompted split.
+
+    Patch the autonomous budget to 1s and the normal prompted budget to a
+    large value, then prompt an autonomous session. It must still expire
+    quickly — proving the autonomous budget won the selection; a wrong
+    branch would sit on the prompted budget and never complete within the
+    test's window.
+    """
+    _configure()
+    monkeypatch.setattr(session_mod, "AUTONOMOUS_IDLE_BUDGET_SECS", 1)
+    monkeypatch.setattr(session_mod, "IDLE_EXPIRY_PROMPTED_SECS", 100_000)
+    start = SessionStart(
+        run=SessionSpec(
+            model="mock", system_prompt="e2e", tools=["echo"], autonomous=True
+        ),
+        session_id=SESSION_ID,
+    )
+    async with await _workflow_env() as env, Worker(
+        env.client,
+        task_queue="t",
+        workflows=[AgentSession],
+        plugins=[_plugin([AIMessage(content="hi")])],
+    ):
+        handle = await env.client.start_workflow(
+            AgentSession.run,
+            args=[start, None, None],
+            id=session_workflow_id(SESSION_ID),
+            task_queue="t",
+        )
+        await _prompt_and_wait(env.client, handle, "kickoff", 0)
+        # Between turns the idle wait uses the autonomous budget and expires.
+        await asyncio.wait_for(handle.result(), timeout=15)
         info = await handle.describe()
         assert info.status.name == "COMPLETED"
