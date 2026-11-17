@@ -952,14 +952,28 @@ class AgentSession:
     @workflow.signal
     def pr_merged(self, event: PrEvent) -> None:
         """Watcher: a PR authored by this session was merged. The agent wakes
-        at the next loop iteration and reviews the rollout."""
+        at the next loop iteration and must VERIFY the merged change.
+
+        The watcher is a singleton that re-arms itself: any PR THIS session
+        opens (it carries the ``agent-session`` marker) re-triggers this
+        signal on merge, so a follow-up fix PR keeps the wake loop alive
+        until the change is actually verified. The wake text says so, so an
+        autonomous session does not stop at "merged, looks fine"."""
         self._queue.append(
             PromptIn(
                 text=(
                     f"[system] PR #{event.number} ({event.repo}) was merged: "
-                    f"{event.title} ({event.url}). Review the effects of this "
-                    "change with your read-only tools; open a follow-up PR if "
-                    "anything needs fixing."
+                    f"{event.title} ({event.url}). Your re-wake-on-merge loop "
+                    "is re-armed: any PR you open from here will wake you "
+                    "again on its merge. Do not report done yet. Instead: (1) "
+                    "verify the merged change is live end-to-end — Flux "
+                    "reconciled the revision, rollout applied, health gates "
+                    "green, and observed behaviour matches the intent of the "
+                    "PR; (2) if anything is wrong, unverified, or only "
+                    "partially rolled out, diagnose, fix it, and open a "
+                    "follow-up PR (the loop stays armed); (3) only when the "
+                    "change is fully verified say so plainly and stop. If all "
+                    "is well and nothing further is needed, say exactly that."
                 ),
                 kind="system",
             )
