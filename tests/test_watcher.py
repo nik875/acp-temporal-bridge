@@ -133,6 +133,10 @@ async def test_watcher_signals_session_once_per_pr(
             f"session never received the pr_merged signal (http_calls={http_calls['n']})"
         )
         assert "PR #7 (infra)" in landed[0]
+        # Wake text must push verification + self-re-arm, not a bare "review".
+        assert "re-wake-on-merge loop is re-armed" in landed[0]
+        assert "verify the merged change is live end-to-end" in landed[0]
+        assert "open a follow-up PR" in landed[0]
         # Give the watcher another poll or two; the signal must not re-land.
         await asyncio.sleep(0.3)
         info2 = await session_handle.query(AgentSession.transcript_tail)  # type: ignore[arg-type]

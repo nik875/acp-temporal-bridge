@@ -286,3 +286,41 @@ async def test_detach_mid_turn_pauses_then_readopt_completes() -> None:
         await asyncio.sleep(0.1)
         events, _ = await asyncio.wait_for(collect, timeout=30)
         assert events[-1]["stop_reason"] == "end_turn", events
+
+
+async def test_autonomous_bypasses_detached_gate(monkeypatch: Any) -> None:
+    """Autonomous sessions run headless: a detached gate cannot pause them.
+
+    Arm the gate and detach it, with a 1s UI_LOST budget. A non-autonomous
+    turn would trip that budget and fail (stop_reason="error", cf.
+    test_detached_turn_fails_cleanly_session_survives); the autonomous run
+    bypasses the gate entirely and completes normally.
+    """
+    _configure()
+    monkeypatch.setattr(session_mod, "UI_LOST_TURN_BUDGET_SECS", 1.0)
+    start = SessionStart(
+        run=SessionSpec(
+            model="mock",
+            system_prompt="e2e",
+            tools=["echo"],
+            autonomous=True,
+        ),
+        session_id=SESSION_ID,
+    )
+    async with await _workflow_env() as env, Worker(
+        env.client,
+        task_queue="t",
+        workflows=[AgentSession],
+        plugins=[_plugin(["headless ok."])],
+    ):
+        handle = await env.client.start_workflow(
+            AgentSession.run,
+            args=[start, None, None],
+            id=session_workflow_id(SESSION_ID),
+            task_queue="t",
+        )
+        # Arm then detach — the gate is now armed and not live.
+        await handle.signal(AgentSession.ui_heartbeat, 1)
+        await handle.signal(AgentSession.ui_detached, 1)
+        events, _ = await _prompt_and_wait(env.client, handle, "work", 0)
+        assert events[-1]["stop_reason"] == "end_turn", events
