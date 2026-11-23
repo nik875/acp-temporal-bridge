@@ -41,7 +41,10 @@ from datetime import timedelta
 from typing import Any, get_args
 
 import temporalio.client as tc
-from acp.core import AgentSideConnection  # low-level; acp.run_agent is stdio-only
+from acp.core import (  # low-level; acp.run_agent is stdio-only
+    DEFAULT_STDIO_BUFFER_LIMIT_BYTES,
+    AgentSideConnection,
+)
 from acp.exceptions import RequestError
 from acp.helpers import text_block, tool_content, update_plan
 from acp.interfaces import Client
@@ -80,6 +83,14 @@ from .session import (
 )
 
 BRIDGE_PORT = int(os.environ.get("ACP_BRIDGE_PORT", "8080"))
+
+# Reader buffer for a single NDJSON-frame: asyncio.start_server defaults to a
+# 64 KiB limit, which any real attachment blows past — an ACP prompt carrying
+# one base64 image is a single >64 KiB line, and ``readline()`` raises
+# "Separator is not found, and chunk exceed the limit" (the connection dies and
+# the UI reports the agent as unresponsive). ACP's own stdio transport uses a
+# 50 MiB limit; match it so a whole fenced attachment fits on one frame.
+ACP_STREAM_LIMIT = DEFAULT_STDIO_BUFFER_LIMIT_BYTES
 
 
 def _bridge_version() -> str:
@@ -1056,6 +1067,7 @@ async def serve() -> None:
         lambda r, w: _handle_connection(temporal, r, w),
         host=os.environ.get("ACP_BRIDGE_BIND", "0.0.0.0"),
         port=BRIDGE_PORT,
+        limit=ACP_STREAM_LIMIT,
     )
     async with server:
         # serve_forever never returns normally; suppress the shutdown noise.
