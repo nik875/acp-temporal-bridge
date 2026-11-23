@@ -71,9 +71,7 @@ def test_plugin_chat_generation_chunk() -> None:
     # The streaming activity publishes dump_object(ChatGenerationChunk) —
     # recognize it by the "generations" key and pull the delta text out.
     dump = {
-        "generations": [
-            {"text": "de", "message": {"content": "de", "type": "AIMessageChunk"}}
-        ],
+        "generations": [{"text": "de", "message": {"content": "de", "type": "AIMessageChunk"}}],
         "type": "ChatGenerationChunk",
     }
     outs = translate_stream_item(dump)
@@ -85,6 +83,62 @@ def test_plugin_chat_generation_chunk() -> None:
 def test_turn_end_is_not_an_acp_update() -> None:
     # turn_end terminates prompt() in the bridge; translation yields nothing.
     assert translate_stream_item({"kind": "turn_end", "stop_reason": "end_turn"}) == []
+
+
+def test_lc_dump_reasoning_becomes_a_thought() -> None:
+    # Provider thinking arrives in additional_kwargs on the serialized chunk
+    # dump (base ChatOpenAI drops the non-standard field from content).
+    dump = {
+        "lc": 1,
+        "type": "constructor",
+        "id": ["langchain", "schema", "messages", "AIMessageChunk"],
+        "kwargs": {"content": "", "additional_kwargs": {"reasoning_content": "hmm"}},
+    }
+    outs = translate_stream_item(dump)
+    assert len(outs) == 1
+    assert isinstance(outs[0], AgentThoughtChunk)
+    assert outs[0].content.text == "hmm"
+
+
+def test_lc_dump_text_is_still_a_message() -> None:
+    outs = translate_stream_item({"lc": 1, "kwargs": {"content": "hi"}})
+    assert len(outs) == 1
+    assert isinstance(outs[0], AgentMessageChunk)
+    assert outs[0].content.text == "hi"
+
+
+def test_generations_dump_reasoning_becomes_a_thought() -> None:
+    dump = {
+        "type": "ChatGenerationChunk",
+        "generations": [
+            {
+                "text": "",
+                "message": {
+                    "content": "",
+                    "type": "AIMessageChunk",
+                    "additional_kwargs": {"reasoning": "why"},
+                },
+            }
+        ],
+    }
+    outs = translate_stream_item(dump)
+    assert len(outs) == 1
+    assert isinstance(outs[0], AgentThoughtChunk)
+    assert outs[0].content.text == "why"
+
+
+def test_reasoning_content_blocks_become_a_thought() -> None:
+    dump = {"lc": 1, "kwargs": {"content": [{"type": "thinking", "text": "t"}]}}
+    outs = translate_stream_item(dump)
+    assert len(outs) == 1
+    assert isinstance(outs[0], AgentThoughtChunk)
+    assert outs[0].content.text == "t"
+
+
+def test_reasoning_dump_without_text_yields_only_a_thought() -> None:
+    dump = {"lc": 1, "kwargs": {"content": "", "additional_kwargs": {"reasoning_content": "x"}}}
+    outs = translate_stream_item(dump)
+    assert [type(o).__name__ for o in outs] == ["AgentThoughtChunk"]
 
 
 def test_unknown_shapes_yield_empty() -> None:

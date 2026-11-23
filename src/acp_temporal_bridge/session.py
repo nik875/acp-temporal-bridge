@@ -313,6 +313,30 @@ def _text_of(content: Any) -> str:
     return str(content)
 
 
+def _reasoning_of(message: Any) -> str:
+    """Provider thinking text on a chunk, if any (else "").
+
+    Reasoning providers (DeepSeek and OpenAI-compatible ones such as Venice)
+    stream thinking in a separate ``reasoning_content`` delta field next to an
+    empty ``content``; some name it ``reasoning``, or emit content blocks typed
+    ``reasoning``/``thinking``. The agent-side model preserves it in
+    ``additional_kwargs`` (see the worker's ``ReasoningChatOpenAI``).
+    """
+    kwargs = getattr(message, "additional_kwargs", None) or {}
+    for key in ("reasoning_content", "reasoning"):
+        value = kwargs.get(key)
+        if isinstance(value, str) and value:
+            return value
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") in ("reasoning", "thinking")
+        )
+    return ""
+
+
 def _cap_json(value: Any, cap: int) -> Any:
     """Bound a published value's serialized size (display-only entries:
     the executing tools always see the real args from graph state)."""
@@ -768,9 +792,7 @@ class AgentSession:
             # unpatched histories keeps old runs replay-safe; None for
             # autonomous sessions (headless — see _gated_turn).
             ui_gate=(
-                None
-                if run.autonomous or not workflow.patched("bridge.ui-gate")
-                else self._wait_ui
+                None if run.autonomous or not workflow.patched("bridge.ui-gate") else self._wait_ui
             ),
             activity_options={
                 "start_to_close_timeout": timedelta(seconds=MODEL_START_TO_CLOSE_SECS),
@@ -884,9 +906,27 @@ class AgentSession:
         return InMemorySaver()
 
     def _on_message_chunk(self, data: tuple[Any, dict[str, Any]]) -> None:
+        """One ``messages``-mode chunk -> a ``message`` (or ``thought``) event.
+
+        ``stream_mode="messages"`` yields the graph's messages, not only model
+        tokens: the tool node's ``ToolMessage`` comes through here too, so its
+        content would otherwise be published as assistant text AND rendered as
+        the tool card (``_on_update`` -> ``tool_end``) — the double dump. Only
+        model-authored messages are text. The guard is ``isinstance``: a
+        ``ToolMessage`` HAS a ``content`` attribute, so the old
+        ``not isinstance(...) and not hasattr(...)`` check never fired.
+
+        Provider thinking rides the same stream — reasoning ticks carry no
+        content but ``reasoning_content`` in ``additional_kwargs`` — and goes
+        out as ``kind: "thought"`` (already in the wire vocabulary; the bridge
+        maps it to ``agent_thought_chunk``), never into the answer text.
+        """
         chunk = data[0] if isinstance(data, tuple) else data
-        if not isinstance(chunk, AIMessage) and not hasattr(chunk, "content"):
+        if not isinstance(chunk, AIMessage):
             return
+        reasoning = _reasoning_of(chunk)
+        if reasoning:
+            _publish(self._stream, {"kind": "thought", "text": reasoning})
         text = _text_of(getattr(chunk, "content", ""))
         if text:
             _publish(self._stream, {"kind": "message", "text": text})
