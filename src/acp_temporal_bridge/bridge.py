@@ -247,6 +247,63 @@ def _lc_message_text(dump: dict[str, Any]) -> str:
     return ""
 
 
+def _dump_message_kwargs(dump: dict[str, Any]) -> list[dict[str, Any]]:
+    """The serialized message kwargs of a plugin stream dump, if any.
+
+    Two shapes reach here: a dumped ``ChatGenerationChunk`` (``generations``
+    key, each with a ``message`` dict) and a serialized LC message
+    (``{"lc": ..., "kwargs": {...}}`` — what ``dump_object`` produces).
+    """
+    out: list[dict[str, Any]] = []
+    if "generations" in dump:
+        for gen in dump.get("generations") or []:
+            if isinstance(gen, dict) and isinstance(gen.get("message"), dict):
+                out.append(gen["message"])
+    elif isinstance(dump.get("kwargs"), dict):
+        out.append(dump["kwargs"])
+    return out
+
+
+def _dump_reasoning(dump: dict[str, Any]) -> str:
+    """Provider thinking text in a stream dump, if any (else "").
+
+    Providers stream reasoning in a non-standard ``reasoning_content`` field
+    (some use ``reasoning``); the agent-side model preserves it in
+    ``additional_kwargs``, which serializes alongside ``content``.
+    """
+    for kwargs in _dump_message_kwargs(dump):
+        additional = kwargs.get("additional_kwargs")
+        if isinstance(additional, dict):
+            for key in ("reasoning_content", "reasoning"):
+                value = additional.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        content = kwargs.get("content")
+        if isinstance(content, list):
+            joined = "".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") in ("reasoning", "thinking")
+            )
+            if joined:
+                return joined
+    return ""
+
+
+def _delta_updates(text: str, reasoning: str) -> list[Any]:
+    """Model delta -> thought update (if any) then text update (if any)."""
+    updates: list[Any] = []
+    if reasoning:
+        updates.append(
+            AgentThoughtChunk(session_update="agent_thought_chunk", content=text_block(reasoning))
+        )
+    if text:
+        updates.append(
+            AgentMessageChunk(session_update="agent_message_chunk", content=text_block(text))
+        )
+    return updates
+
+
 def _transcript_message(dump: dict[str, Any]) -> tuple[str, str]:
     """(role, text) from one durable-transcript message dump.
 
@@ -283,30 +340,17 @@ def translate_stream_item(item: Any) -> list[Any]:
         return []
     # Plugin model deltas: dumped ChatGenerationChunk (recognizable by the
     # "generations" key) or a serialized LC message(-chunk) dump ("lc"/"kwargs").
+    # Reasoning deltas carry thinking instead of text -> thought update.
     if "generations" in data:
-        text = _chunk_text(data)
-        return (
-            [AgentMessageChunk(session_update="agent_message_chunk", content=text_block(text))]
-            if text
-            else []
-        )
+        return _delta_updates(_chunk_text(data), _dump_reasoning(data))
     if "lc" in data and isinstance(data.get("kwargs"), dict):
-        text = _lc_message_text(data)
-        return (
-            [AgentMessageChunk(session_update="agent_message_chunk", content=text_block(text))]
-            if text
-            else []
-        )
+        return _delta_updates(_lc_message_text(data), _dump_reasoning(data))
     kind = data.get("kind")
     if kind in ("message", "thought"):
-        text = data.get("text", "")
-        if not text:
-            return []
-        if kind == "message":
-            return [
-                AgentMessageChunk(session_update="agent_message_chunk", content=text_block(text))
-            ]
-        return [AgentThoughtChunk(session_update="agent_thought_chunk", content=text_block(text))]
+        return _delta_updates(
+            data.get("text", "") if kind == "message" else "",
+            data.get("text", "") if kind == "thought" else "",
+        )
     if kind == "tool_start":
         return [
             ToolCallStart(
@@ -789,7 +833,7 @@ class BridgeAgent:
                     raise RequestError.internal_error(
                         {
                             "details": (
-                                f"session {session_id}: turn ended with " f"stop_reason={reason!r}"
+                                f"session {session_id}: turn ended with stop_reason={reason!r}"
                             ),
                             "stop_reason": reason,
                         }
