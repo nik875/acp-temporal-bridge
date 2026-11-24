@@ -807,8 +807,12 @@ class AgentSession:
         backend = get_backend_builder()() if get_backend_builder() else None
         # Shared compaction factory (tests/test_path_parity.py guards that BOTH
         # paths -- this interactive one and the headless DurableAgent -- route
-        # through it with the registry-sourced trigger).
-        middleware = compaction_middleware(model, backend, run.compact_at_tokens)
+        # through it with the registry-sourced trigger). The sink surfaces
+        # compaction to the client as a tool card, so an auto-compaction is a
+        # visible action instead of a silent context shift.
+        middleware = compaction_middleware(
+            model, backend, run.compact_at_tokens, on_event=self._report_compaction
+        )
         # Memory files (host seam) are injected into the system prompt every
         # turn by deepagents' memory middleware; None keeps the default.
         memory = get_memory_sources()
@@ -904,6 +908,32 @@ class AgentSession:
         from langgraph.checkpoint.memory import InMemorySaver
 
         return InMemorySaver()
+
+    def _report_compaction(self, event: dict[str, Any]) -> None:
+        """Compaction edges -> ``tool_start``/``tool_end`` (a visible action).
+
+        Same rendering as any tool card, so the client shows "Compacting
+        conversation" instead of a silent context shift. Sync sink: publishing
+        to the workflow stream is not awaited.
+        """
+        if event.get("phase") == "start":
+            _publish(
+                self._stream,
+                {
+                    "kind": "tool_start",
+                    "id": str(event.get("id") or ""),
+                    "name": f"Compacting conversation ({event.get('messages', 0)} messages)",
+                    "args": {"trigger_tokens": event.get("trigger")},
+                },
+            )
+            return
+        output = str(event.get("summary") or "")
+        if event.get("error"):
+            output = f"compaction failed: {event['error']}"
+        _publish(
+            self._stream,
+            {"kind": "tool_end", "id": str(event.get("id") or ""), "output": output[:4000]},
+        )
 
     def _on_message_chunk(self, data: tuple[Any, dict[str, Any]]) -> None:
         """One ``messages``-mode chunk -> a ``message`` (or ``thought``) event.
